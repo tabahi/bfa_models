@@ -1,0 +1,113 @@
+# Main training configuration for p3cupe.
+# Run with: /root/anaconda3/bin/python p3cupe/train_cupe.py p3cupe/cupe_hp
+
+experiment: "pa08a"
+note: "10s soft_phone_frames: 10 attn_radius: 2"
+project: "cupe_usp5"
+
+# Basic run settings.
+gpu_num: [0, 1]
+data_src: "libri_100h" # Dataset name understood by the split manager.
+epochs: 1               # Number of passes through the data. Also sets the LR schedule length.
+dev_run: false          # true = run only a tiny test. Use this after changing the config.
+seed: 42                # Random seed.
+
+# Batch and memory settings.
+batch_size: 108         # Clips processed at once on each GPU. Lower this if GPU memory is full.
+accumulate_grad_batches: 2 # Update after this many batches. Larger values increase effective batch size.
+dataloader_n_workers: 2 # CPU workers that prepare audio.
+
+# true = every batch has the same padded shape and uses predictable GPU memory.
+# false = shorter batches can use less memory, but memory use will vary from batch to batch.
+fixed_window_batch: true
+
+# Controls how PyTorch reserves and reuses GPU memory. This is about the memory manager,
+# not the amount of memory the model needs.
+# Empty uses PyTorch's normal caching allocator and is recommended for fixed shapes.
+# expandable_segments:True can reduce wasted reserved memory when batch shapes vary.
+# Leave this empty unless you have measured a problem caused by changing batch shapes.
+cuda_alloc_conf: ""
+
+# Data limits.
+duration_max: 10        # Ignore clips longer than this many seconds; also sets padding width.
+ph_seq_max: 64          # Maximum number of phones kept in one sequence.
+
+# Audio windows. The model processes each window separately, then stitches the outputs together.
+window_size_ms: 120     # Audio context given to the model at one time.
+window_stride_ms: 80    # Distance between window starts. Must line up with the 5 ms frame grid.
+
+# Model size and context.
+cnn_channels: 192       # Width of the first convolution. Larger means more model capacity.
+embed_dim: 512          # Width of each frame representation. Larger uses more memory.
+context_kernels: [5, 3] # Nearby-time context. Larger kernels see more time and may blur boundaries.
+frame_blocks: 4         # Per-frame processing depth. 0 removes these extra blocks.
+ffn_mult: 4             # Width inside each frame block, as a multiple of embed_dim.
+block_dropout: 0.1      # Dropout inside frame blocks.
+attn_radius: 2          # Local attention range in frames. 0 disables attention.
+attn_heads: 8           # Number of attention heads. Must divide embed_dim when attention is on.
+cnn_dropout: 0.1        # Dropout in the convolutional layers.
+head_dropout: 0.1       # Dropout before the output heads.
+noise_level: 0.01       # Small waveform noise added during training.
+
+phoneme_classes: 66     # Number of real phoneme classes. The model adds one reserved output slot.
+phoneme_groups: 16      # Number of broad phoneme groups. Also gets one reserved output slot.
+
+# Loss and alignment settings.
+# The decoder places the known phone sequence onto the audio frames. The loss trains the model
+# to reproduce that placement. There are no boundary labels in the training data.
+min_phone_frames: 6     # Hard minimum phone length, in 5 ms frames.
+soft_phone_frames: 10   # Extra phone length allowed by the soft duration rule.
+soft_frame_cost: 1.0    # Cost for making a phone shorter than the soft duration target.
+sil_skippable: true     # Allow SIL phones inside a sentence to use zero frames.
+
+# Add an acoustic-change preference when starting a new phone.
+boundary_bonus_weight: 30.0 # 0 disables this preference; larger values trust acoustic changes more.
+boundary_contrast_frames: 17 # Width of the local moving average used to find acoustic peaks.
+boundary_flux_source: mel    # mel = fixed log-mel changes; tap = learned CNN feature changes.
+
+# Width of the soft transition between neighboring phones.
+ramp_frames: 3.0        # Half-width in frames. 3 frames is 15 ms on each side.
+
+group_loss_weight: 0.3  # Strength of the broad phoneme-group loss. 0 disables it.
+optional_sil: true      # Add optional SIL at the beginning and end of each clip.
+class_prior_norm: true  # Stop common phoneme classes from dominating the alignment.
+
+# Target softness.
+soft_target_mix: 1.0    # 0 = one best alignment; 1 = average over many possible alignments.
+soft_target_scale: 0.3  # Lower values make the average softer and less certain.
+
+# Cold-start alignment help.
+# Use a nonzero value when training from random weights. Keep this at 0 for a normal warm start.
+align_prior_epochs: 0   # Number of early epochs that use the even-duration alignment hint.
+align_prior_sigma: 0.03 # How far the alignment may move from the even-duration path.
+align_prior_strength: 1.0 # Strength of that hint.
+
+# Validation.
+val_max_segments: 400   # Maximum validation clips used each epoch.
+light_val_metrics: true # Skip slow secondary validation calculations.
+per_enabled: false      # Calculate PER/GER. false is faster and is recommended here.
+per_mode: "greedy"      # PER decoding method.
+per_max_segments: 100   # Maximum PER clips per GPU rank.
+per_every_n_epochs: 1   # Calculate PER every N epochs.
+
+# TIMIT boundary probe. This is validation only; it does not add labels to training.
+timit_probe_enabled: true
+timit_probe_cache: "tmp/data/timit_probe_400.json" # JSON file containing probe audio and labels.
+timit_probe_batch_size: 16
+timit_probe_every_n_epochs: 1
+
+# Optimizer.
+lr: 5e-5               # Maximum learning rate. Use a larger value when training from scratch.
+weight_decay: 0.01     # Regularization strength.
+gradient_clip_val: 1.0 # Prevent unusually large updates.
+
+# Checkpoint selection and early stopping.
+ckpt_monitor: "val_timit_nobonus_f1_25ms" # Metric used to keep the best checkpoints.
+ckpt_mode: "max"                          # Higher is better for this metric.
+early_stop_metric: "val_loss"             # Metric used to decide when to stop.
+early_stop_mode: "min"                    # Lower is better for validation loss.
+patience: 3000                             # Epochs allowed without improvement.
+
+# Leave empty for training from random weights. Set this to a checkpoint for a warm start.
+ckpt_path: "tmp/training/p3cupe/pa07e/m_pa07e_final_e1.pt"
+

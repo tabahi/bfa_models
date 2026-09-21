@@ -1,0 +1,5 @@
+# Copy this file to .local_paths.yaml and adjust the paths for your machine.
+timit_paths_list: /path/to/paths_list_TIMIT_all.json
+timit_test_paths_list: /path/to/paths_list_TIMIT_test.json
+speech_data_manager_paths_manager: data/paths_manager_example
+metadata_base: /path/to/metadata_base
