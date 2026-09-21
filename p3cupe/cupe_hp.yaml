@@ -1,14 +1,14 @@
 # Main training configuration for p3cupe.
 # Run with: /root/anaconda3/bin/python p3cupe/train_cupe.py p3cupe/cupe_hp
 
-experiment: "pa08a"
-note: "10s soft_phone_frames: 10 attn_radius: 2"
+experiment: "pa09a"
+note: "10s soft_phone_frames: 10 attn_radius: 0"
 project: "cupe_usp5"
 
 # Basic run settings.
 gpu_num: [0, 1]
-data_src: "libri_100h" # Dataset name understood by the split manager.
-epochs: 1               # Number of passes through the data. Also sets the LR schedule length.
+data_src: "mswc38_50h" # mswc38_50h, MLS_8l_train10h, MLS_7l_100h, libri_100h, libri_360h, libri_500h, ucla ...
+epochs: 3              # Number of passes through the data. Also sets the LR schedule length.
 dev_run: false          # true = run only a tiny test. Use this after changing the config.
 seed: 42                # Random seed.
 
@@ -43,7 +43,7 @@ context_kernels: [5, 3] # Nearby-time context. Larger kernels see more time and 
 frame_blocks: 4         # Per-frame processing depth. 0 removes these extra blocks.
 ffn_mult: 4             # Width inside each frame block, as a multiple of embed_dim.
 block_dropout: 0.1      # Dropout inside frame blocks.
-attn_radius: 2          # Local attention range in frames. 0 disables attention.
+attn_radius: 0          # Local attention range in frames. 0 disables attention.
 attn_heads: 8           # Number of attention heads. Must divide embed_dim when attention is on.
 cnn_dropout: 0.1        # Dropout in the convolutional layers.
 head_dropout: 0.1       # Dropout before the output heads.
@@ -91,7 +91,7 @@ per_max_segments: 100   # Maximum PER clips per GPU rank.
 per_every_n_epochs: 1   # Calculate PER every N epochs.
 
 # TIMIT boundary probe. This is validation only; it does not add labels to training.
-timit_probe_enabled: true
+timit_probe_enabled: true # set false to disable TIMIT probe validation. TIMIT is a proprietary dataset and not shared with this repo.
 timit_probe_cache: "tmp/data/timit_probe_400.json" # JSON file containing probe audio and labels.
 timit_probe_batch_size: 16
 timit_probe_every_n_epochs: 1

@@ -44,9 +44,10 @@ sys.path.insert(0, REPO_ROOT)
 from local_paths import get_path
 
 PATHS_LIST = get_path("timit_paths_list")
+TEST_PATHS_LIST = get_path("timit_test_paths_list")
 # The `all` list is the one whose SRTs actually carry `boundaries`, but it tags every entry
 # `set: 'all'`, so the test split has to be identified by clip_id against this list.
-TEST_PATHS_LIST = get_path("timit_test_paths_list")
+
 DEFAULT_OUT = "tmp/data/timit_probe_400.json"
 DEFAULT_N = 400
 SEED = 42

@@ -1,9 +1,10 @@
-from os.path import exists
+from os.path import exists, join
 import json
-from bournemouth_aligner import Phonemizer_ph66 as Phonemizer
+from bournemouth_aligner import Phonemizer_ph66 as Phonemizer # currently using ph66 from v2.0, it may change in the future depending on models and languages
 from local_paths import get_path
 
-metdata_base = get_path("metadata_base")
+METADATA_BASE = get_path("metadata_base") # meta_data_base is the base path for all metadata files, including srt and ts files. It is set in local_paths.py - It's purpose is allow moveable relative paths for meatadata files.
+
 
 def phonemize_texts(paths_list, redo=False, langs =  ['en']):
     '''
@@ -121,6 +122,8 @@ def phonemize_texts(paths_list, redo=False, langs =  ['en']):
             if (paths_list[i]['lang']==lang):
                 srt_path = paths_list[i]['srt']
                 ts_path = paths_list[i]['ts']
+                if (srt_path[0:2] == '$/'): srt_path = join(METADATA_BASE, srt_path[2:])
+                if (ts_path[0:2] == '$/'): ts_path = join(METADATA_BASE, ts_path[2:])
                 if (not exists(ts_path)) or redo:
                     if (exists(srt_path)):
                         phonemize_segments(srt_path, ts_path)

@@ -1,5 +1,16 @@
 # Copy this file to .local_paths.yaml and adjust the paths for your machine.
-timit_paths_list: /path/to/paths_list_TIMIT_all.json
+
+# You must get your own license for TIMIT data. The paths below are examples and will not work for you. 
+# You can use the same paths for training and test data, but you must have a valid license to use TIMIT or you can simply remove TIMIT from validation.
+# You can ignore the following 2 paths if you already have "utils/timit_probe_400.json" which is relative to this repo.
+timit_paths_list: /path/to/paths_list_TIMIT_all.json # only used by utils/timit_probe_prep.py
 timit_test_paths_list: /path/to/paths_list_TIMIT_test.json
-speech_data_manager_paths_manager: data/paths_manager_example
+
+speech_data_manager_paths_manager: data/paths_manager_example # an example of path _manager is given here. You can use it as is, or you can create your own path manager for your own data.
+
+ # meta_data_base is the base path for all metadata files, including srt and ts files. It is set in local_paths.py 
+ # It's purpose is allow moveable relative paths for meatadata files.
+ # You can store metadata files anywhere, but the paths in the paths_list json files must be relative to this base path.
+ # This way, if you move the metadata files to a different location, you only need to change this one path in local_paths.py, and all the relative paths in the paths_list json files will still work.
+  # Note that this does not apply to raw source audio files. It's only for metadata files generateed/used by this repo.
 metadata_base: /path/to/metadata_base
