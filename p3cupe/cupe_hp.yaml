@@ -1,14 +1,14 @@
 # Main training configuration for p3cupe.
 # Run with: /root/anaconda3/bin/python p3cupe/train_cupe.py p3cupe/cupe_hp
 
-experiment: "pa09a"
-note: "10s soft_phone_frames: 10 attn_radius: 0"
+experiment: "pa05a"
+note: "min_phone_frames: 3"
 project: "cupe_usp5"
 
 # Basic run settings.
 gpu_num: [0, 1]
-data_src: "mswc38_50h" # mswc38_50h, MLS_8l_train10h, MLS_7l_100h, libri_100h, libri_360h, libri_500h, ucla ...
-epochs: 3              # Number of passes through the data. Also sets the LR schedule length.
+data_src: "MLS_7l_100h" # mswc38_50h, MLS_7l_100h, libri_100h, libri_360h, libri_500h, ucla ...
+epochs: 10              # Number of passes through the data. Also sets the LR schedule length.
 dev_run: false          # true = run only a tiny test. Use this after changing the config.
 seed: 42                # Random seed.
 
@@ -55,7 +55,7 @@ phoneme_groups: 16      # Number of broad phoneme groups. Also gets one reserved
 # Loss and alignment settings.
 # The decoder places the known phone sequence onto the audio frames. The loss trains the model
 # to reproduce that placement. There are no boundary labels in the training data.
-min_phone_frames: 6     # Hard minimum phone length, in 5 ms frames.
+min_phone_frames: 3     # Hard minimum phone length, in 5 ms frames.
 soft_phone_frames: 10   # Extra phone length allowed by the soft duration rule.
 soft_frame_cost: 1.0    # Cost for making a phone shorter than the soft duration target.
 sil_skippable: true     # Allow SIL phones inside a sentence to use zero frames.
@@ -109,5 +109,5 @@ early_stop_mode: "min"                    # Lower is better for validation loss.
 patience: 3000                             # Epochs allowed without improvement.
 
 # Leave empty for training from random weights. Set this to a checkpoint for a warm start.
-ckpt_path: "tmp/training/p3cupe/pa07e/m_pa07e_final_e1.pt"
+ckpt_path: "tmp/training/p3cupe/pa09b/m_pa09b_final_e1.pt"
 
