@@ -1,14 +1,17 @@
 # Main training configuration for p3cupe.
 # Run with: /root/anaconda3/bin/python p3cupe/train_cupe.py p3cupe/cupe_hp
 
-experiment: "pa05a"
-note: "min_phone_frames: 3"
+# FINAL RECIPE (2026-09-24): the only settings in this lineage that reached 75+ f1@25 - pa01d's
+# (75.8-76.1) and pa07f's, which descends from it - with every pb-era addition switched OFF.
+# See memory.md "START HERE". Never reuse an experiment name (pb01b ran as "pb01a" by accident).
+experiment: "pc01a"
+note: "final recipe: hard-EM, mel bonus 30, min 6 + soft 10, libri_500h, warm from pa07f"
 project: "cupe_usp5"
 
 # Basic run settings.
 gpu_num: [0, 1]
-data_src: "MLS_7l_100h" # mswc38_50h, MLS_7l_100h, libri_100h, libri_360h, libri_500h, ucla ...
-epochs: 10              # Number of passes through the data. Also sets the LR schedule length.
+data_src: "libri_500h" # mswc38_50h, MLS_7l_100h, libri_100h, libri_360h, libri_500h, ucla ...
+epochs: 10               # pa01d's run length. Also sets the LR schedule length (OneCycle).
 dev_run: false          # true = run only a tiny test. Use this after changing the config.
 seed: 42                # Random seed.
 
@@ -16,6 +19,7 @@ seed: 42                # Random seed.
 batch_size: 108         # Clips processed at once on each GPU. Lower this if GPU memory is full.
 accumulate_grad_batches: 2 # Update after this many batches. Larger values increase effective batch size.
 dataloader_n_workers: 2 # CPU workers that prepare audio.
+limit_data: 0           # 0 = all files. 10000 (~176 steps/epoch) was for fast diagnostics only.
 
 # true = every batch has the same padded shape and uses predictable GPU memory.
 # false = shorter batches can use less memory, but memory use will vary from batch to batch.
@@ -45,6 +49,11 @@ ffn_mult: 4             # Width inside each frame block, as a multiple of embed_
 block_dropout: 0.1      # Dropout inside frame blocks.
 attn_radius: 0          # Local attention range in frames. 0 disables attention.
 attn_heads: 8           # Number of attention heads. Must divide embed_dim when attention is on.
+
+# Local-change branch into the classifier (pb02a): the head used it (delta_share 0.18) and it
+# changed nothing. Off. Keep the overrides list empty unless growing a checkpoint on purpose.
+local_delta: 0
+warm_start_arch_overrides: []
 cnn_dropout: 0.1        # Dropout in the convolutional layers.
 head_dropout: 0.1       # Dropout before the output heads.
 noise_level: 0.01       # Small waveform noise added during training.
@@ -55,26 +64,115 @@ phoneme_groups: 16      # Number of broad phoneme groups. Also gets one reserved
 # Loss and alignment settings.
 # The decoder places the known phone sequence onto the audio frames. The loss trains the model
 # to reproduce that placement. There are no boundary labels in the training data.
-min_phone_frames: 3     # Hard minimum phone length, in 5 ms frames.
+# 6 + 10: best on the tune half of the decoder sweep on pa07f, for bonus 0 AND bonus 30
+# (pa07f was trained at 3 + 10; pa01d at 6 + 4, which is within 0.6 of this).
+min_phone_frames: 6     # Hard minimum phone length, in 5 ms frames.
 soft_phone_frames: 10   # Extra phone length allowed by the soft duration rule.
 soft_frame_cost: 1.0    # Cost for making a phone shorter than the soft duration target.
 sil_skippable: true     # Allow SIL phones inside a sentence to use zero frames.
 
 # Add an acoustic-change preference when starting a new phone.
+# 30 in the TRAINING targets: it is the loop's anchor. Measured 2026-09-24 with everything else
+# fixed, 10 epochs: bonus 10 / 3 / 0 end at no-bonus f1@25 72.2 / 70.6 / 68.1, and pa07f and
+# pa01d (the 75+ checkpoints) were both trained at 30. Lowering it to 10 in pb01 is what made
+# every pb run slide. At DECODE time it is a separate choice: 30 for the benchmark f1@25,
+# 0 for per-phone accuracy (it drags stop onsets onto bursts) - the probe reports both.
 boundary_bonus_weight: 30.0 # 0 disables this preference; larger values trust acoustic changes more.
 boundary_contrast_frames: 17 # Width of the local moving average used to find acoustic peaks.
 boundary_flux_source: mel    # mel = fixed log-mel changes; tap = learned CNN feature changes.
 
-# Width of the soft transition between neighboring phones.
+# Width of the soft transition between neighboring phones. 3.0 is what pa01d/pa07f were trained
+# with. At bonus 10 (pb02) 2.0 beat 3.0 by 0.3-0.8 and 4.0 was worse again; never tested at
+# bonus 30 - the one A/B worth running on this recipe.
 ramp_frames: 3.0        # Half-width in frames. 3 frames is 15 ms on each side.
 
 group_loss_weight: 0.3  # Strength of the broad phoneme-group loss. 0 disables it.
 optional_sil: true      # Add optional SIL at the beginning and end of each clip.
 class_prior_norm: true  # Stop common phoneme classes from dominating the alignment.
 
-# Target softness.
-soft_target_mix: 1.0    # 0 = one best alignment; 1 = average over many possible alignments.
+# Target softness. There are two ways to use the average over alignments, and they are not
+# interchangeable. Only one may be nonzero.
+#
+# soft_target_mix put the average into the CLASS DISTRIBUTION, which at 1.0 deleted the hat
+# target outright. The hat's uncertainty is fixed by the segmentation geometry; the average's
+# is whatever the model currently believes, so it shrank as the model sharpened and the target
+# chased its own confidence. Measured over four runs: target entropy 0.086 -> 0.070, frame
+# accuracy 0.52 -> 0.69, and TIMIT boundary f1 72.7 -> 63.5. That is the drift.
+#
+# soft_onset_mix puts the same average into the BOUNDARY POSITIONS instead. The hat survives,
+# its uncertainty stays fixed, and the boundary gains sub-frame precision it could not have on
+# an integer grid. Watch train_target_entropy_ratio: it must sit at 1.0.
+soft_target_mix: 0.0    # the old, distribution-level mix. Leave at 0.
+soft_onset_mix: 0.0     # 0 = one best alignment (hard-EM, pa01d); 1 = average the onsets.
 soft_target_scale: 0.3  # Lower values make the average softer and less certain.
+
+# Widen a boundary's transition in proportion to how unsure the aligner is about it, so a
+# gradual transition is taught gradually instead of as a committed guess. 0 = a constant ramp.
+#
+# MEASURED AND TURNED OFF (pb01a, 10 epochs). onset_sigma_frames sat at ~1.3, so at k=1 the
+# ramps ran ~4.3 frames instead of 3 - 43% wider - and both metrics that measure SHARPNESS
+# fell monotonically for it: dip f1@25 40.0 -> 35.8 and sub f1@10 57.5 -> 55.9, while the
+# tolerant no-bonus f1@25 just plateaued. A softer target where the aligner is unsure buys
+# nothing here and costs the crossing precision the sub-frame readout depends on.
+soft_onset_ramp_k: 0.0    # ramp = ramp_frames + k * (onset standard deviation, in frames)
+soft_onset_ramp_max: 6.0  # Cap. A ramp wider than half a phone makes short phones cheaper to
+                          # the aligner, which feeds the duration squeeze. Watch min_dur_frac.
+
+# The alignment target is built by an averaged copy of the model, not by the live weights.
+# Without this the model is trained to agree with what it believed one step ago, and a wrong
+# boundary is confirmed on the very next step; with it, a drift has to survive the averaging
+# window to persist. Costs one extra forward pass per step.
+# Pick the decay from the step count, not by feel: the averaging horizon is 1/(1-decay)
+# OPTIMISER steps and wants to be roughly half an epoch. Do NOT estimate that from limit_data
+# -- that caps FILES, and the dataset is SEGMENTS, so 10000 files is ~186 optimiser steps per
+# epoch here, not the ~23 the clip count suggests. Half of 186 is ~93 steps -> 0.99. The run
+# prints the measured horizon in epochs at startup and warns if it is too long or too short.
+# FINAL: off. It stopped the soft_target_mix runaway but did not replace the bonus as the
+# anchor (pb02i/j); hard-EM at bonus 30 had no runaway to stop.
+ema_decay: 0.0           # 0 disables the teacher entirely (the old behaviour).
+ema_in_checkpoint: true  # Save the teacher too. Checkpoints without one still load.
+
+# Average the target's boundary positions over time-warped copies of the audio. Resampling
+# must move every real boundary with it, so this is one of the few checks on the segmentation
+# that does not come from the model itself. Where the views disagree the transition is widened
+# instead of committed to (see soft_onset_ramp_k), so disagreement softens the target rather
+# than adding a penalty term.
+# OFF by default, and unlike the settings above it is not backed by any measurement in this
+# project yet - it also costs one extra forward pass per view. Turn it on only after the
+# soft-onset and teacher changes have been judged on their own, or you will not know which
+# one moved the number.
+# MEASURED (pb02h): no effect at 2x the cost. Leave at 0.
+aug_views: 0            # Extra warped views used to build the target. 0 disables this.
+aug_warp_range: 0.05    # Resample rate is drawn from 1 +/- this. Needs aug_views > 0.
+
+# Keep the model's frame-to-frame representation change correlated with log-mel change.
+#
+# The model's own boundary signal is now WEAKER than a parameter-free log-mel flux and gets
+# weaker every epoch (transcript-free f1@25: log-mel 60.3, the model's embedding 53.9 -> 51.8,
+# its posterior dip 40.0 -> 35.8, random init 29.9). Predicting phone identity rewards being
+# invariant to exactly the acoustic change that marks a boundary, so the information is thrown
+# away before the alignment target is ever applied, and no change to the target can recover it.
+#
+# This constrains the EMBEDDING, never the posteriors, and never says where a boundary is -
+# which is what separates it from the flux hinge, the boundary head and the partition CE, all
+# of which were measured and rejected. A stop burst is a big acoustic change inside a single
+# transcribed phone: a term on the posteriors would fight the phoneme loss there, a term on the
+# embedding does not, because the classifier stays free to map both sides to the same phone.
+#
+# UNPROVEN. Measured starting point on pa07f e0, 32 probe clips: the correlation is already
+# 0.615, so there is headroom but the signal is not absent - and note the embedding still
+# scores 8.5 f1 points below raw log-mel at that correlation, which is the gap being chased.
+# The weight is set so the term can actually move: at 0.3 it contributes 0.115 against a CE of
+# ~1.5, i.e. 7% of the loss, which is exactly the "inert at low weight" regime the old flux
+# hinge died in. At 1.0 it is ~20%. It is a correlation, so it is bounded in [0, 2] and cannot
+# blow up whatever the weight; 0.3 and 3.0 are the natural bracket to sweep.
+# Read train_repr_flux_corr against train_peak_ce: a flat correlation means the term is inert,
+# and a rising correlation with a rising peak_ce means identity and change sensitivity are
+# trading off and the weight is too high. Costs the stitched embeddings in the graph (~0.2 GB
+# at this batch size); lower batch_size if it runs out of memory.
+# FINAL: off. It lifts the embedding's own flux f1 above log-mel (60 -> 63) but that never
+# reached the posteriors or the aligner (pb02c/d); 3.0 was +0.2-0.4, within one seed.
+repr_flux_weight: 0.0   # 0 disables this term entirely.
 
 # Cold-start alignment help.
 # Use a nonzero value when training from random weights. Keep this at 0 for a normal warm start.
@@ -102,12 +200,16 @@ weight_decay: 0.01     # Regularization strength.
 gradient_clip_val: 1.0 # Prevent unusually large updates.
 
 # Checkpoint selection and early stopping.
-ckpt_monitor: "val_timit_nobonus_f1_25ms" # Metric used to keep the best checkpoints.
+# The TUNE half with the training decoder (bonus 30): the benchmark number, and selecting on
+# it keeps the holdout (`val_timit_*` without tune_) clean for reporting.
+ckpt_monitor: "val_timit_tune_f1_25ms"    # Metric used to keep the best checkpoints.
 ckpt_mode: "max"                          # Higher is better for this metric.
 early_stop_metric: "val_loss"             # Metric used to decide when to stop.
 early_stop_mode: "min"                    # Lower is better for validation loss.
 patience: 3000                             # Epochs allowed without improvement.
 
 # Leave empty for training from random weights. Set this to a checkpoint for a warm start.
-ckpt_path: "tmp/training/p3cupe/pa09b/m_pa09b_final_e1.pt"
-
+# pa07f epoch 0: the best surviving checkpoint (pa01d e3 was deleted). Decoded with THIS file's
+# settings, before any training: f1@25 76.10 tune / 75.58 holdout (bonus 30, min 6 + soft 10),
+# per-phone 72.45 / 73.07 with bonus 0. A run that does not beat that has not helped.
+ckpt_path: "tmp/training/p3cupe/pa07f/m_pa07f_epoch=0_step=1246_val_timit_nobonus_f1_25ms=73.4052.ckpt"

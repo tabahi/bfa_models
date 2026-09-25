@@ -1,593 +1,514 @@
 # p3cupe — decision record
 
-Written 2026-09-18, at the end of the session that built this package. `README.md` explains
-**how the thing works**; this file is the **why, what was rejected, and what is still unproven**
-— the parts that do not survive in code. Read both before changing the model or the loss.
+`README.md` says **how it works**. This file is the **why, what was rejected, and what is still
+unproven** — the parts that do not survive in code. Read both before changing the model or the
+loss.
+
+Pruned 2026-09-23: the run-by-run narrative of pa01–pa09 was removed once it stopped being
+load-bearing (recoverable via `git show`). What survives is the reasoning, the measurements
+still quoted elsewhere, and everything that must not be reintroduced. Numbers are TIMIT probe
+holdout f1@25 unless said otherwise.
 
 ---
 
-## Status when this was written
+## START HERE — state as of 2026-09-24 (end of the pb02 session)
 
-Run `pa01a` (`libri_100h`, `epochs: 100`, from scratch) is training on the A6000 box and the
-user reports **"this model isn't learning much"**. Not yet diagnosed. **No trained p3cupe model
-exists yet**, so every design claim below is reasoned from p2cupe's measurements, not validated
-on this lineage.
+**The end goal: MFA-style boundary alignment from sequence labels only.** There are no boundary
+labels in training. The objective builds its own targets by aligning the KNOWN phoneme sequence
+to the audio using the model's own posteriors, so it is self-referential by construction and
+its failure mode is drift.
 
-**Check first: the learning rate, not the model.** `epochs` is a learning-rate knob — OneCycle
-spreads warmup over `pct_start=0.3` of the whole run, so:
+### The answer so far, in five lines
 
-| | lr peaks | after epoch 1 / 3 / 5 / 10 |
-|---|---|---|
-| `epochs: 20` | epoch 6 | 3.1e-5, 1.6e-4, **2.8e-4**, 2.4e-4 |
-| `epochs: 100` | **epoch 30** | 1.3e-5, 1.9e-5, **3.1e-5**, 8.4e-5 |
+1. **Best model: pa07f e0, decoded with min 6 + soft 10 + mel bonus 30 → f1@25 76.10 tune /
+   75.58 holdout.** No training needed. For per-phone accuracy, decode the same model with
+   bonus 0: 72.45 / 73.07 per-phone hit@25. MFA on the same clips: 79.1 f1@25.
+2. **`cupe_hp.yaml` is now that recipe** (experiment `pc01a`): hard-EM, bonus 30 in the
+   targets, min 6 + soft 10, ramp 3.0, libri_500h, 4 epochs, warm from pa07f, and every
+   pb-era addition OFF (soft onsets, EMA, repr_flux, aug_views, local_delta). Dev run checked:
+   probe 75.59 holdout / 76.03 tune at step 1, 37.1 GB peak. **Not yet trained.** Run:
+   `/root/anaconda3/bin/python p3cupe/train_cupe.py p3cupe/cupe_hp`. It is judged against
+   the step-1 numbers above; `ckpt_monitor` is now `val_timit_tune_f1_25ms`, so the holdout
+   stays clean for reporting.
+3. **The onset bonus in the TRAINING targets is the loop's anchor** and the only knob found
+   that moves where training settles (bonus 10 / 3 / 0 end at no-bonus 72.2 / 70.6 / 68.1).
+   pb01 lowered it from 30 to 10, and that alone explains the slide of every pb run. Keep
+   decode bonus and training bonus as separate decisions.
+4. **Everything else in the pb02 sweep is measured and dead** (table under "Results since the
+   fix"): local_delta, ramp 3/4, repr_flux 0.3/3, lr 1e-5, aug_views, and offline snapping to
+   any layer's change (`snap_sweep.py`). Nine arms at bonus 10 all end at 70.7–72.4. Do not
+   re-run them.
+5. **Untested and worth one run each, on the final recipe:** training-target bonus above 30
+   (the trend was still rising at 10 → 30), and ramp 2.0 against 3.0 at bonus 30.
 
-At `epochs: 100` the first ~10 epochs run at a tenth of `lr` and look dead. p2cupe lost 10
-GPU-hours to the same trap. Measured from the scheduler; **not** confirmed against pa01a's logs.
+### Tools added this session
+- `train_cupe.py p3cupe/cupe_hp key=value ...`: per-run overrides, values parsed as YAML;
+  unknown keys raise. W&B records the resolved config.
+- `run_pb02.sh [arm ...]`: sequential sweep queue. Waits for free GPUs before each arm; logs go
+  to `tmp/training/p3cupe/logs/<arm>.log`. Never run arms in parallel: that changes the
+  effective batch.
+- `snap_sweep.py <ckpt>`: offline boundary snapping, also usable as a gate for any future
+  boundary-signal idea. If it cannot beat the aligner here, a trained head on the same signal
+  will not either.
+- `decoder_sweep.py <ckpt> --half tune|holdout --bonus .. --min .. --soft ..`: re-decodes a
+  checkpoint in minutes. **Run it on every new checkpoint before believing a training
+  number.** The decoder settings were worth +2.2 on pa07f, more than any training change.
+- Model: `local_delta` (off; zero-init classifier branch) and a printed WARNING when the yaml
+  asks for an additive architecture key without listing it in `warm_start_arch_overrides`.
+- Runs are deterministic: pb02f reproduced pb01b's e0–e3 to two decimals. Seed-to-seed
+  variance is still unmeasured, so treat single-run differences under ~0.4 as noise.
 
-Then, in this order — it separates "the network is not learning" from "the alignment is not
-moving", which need opposite fixes:
+### Gotchas hit this session
+- PyYAML reads `1e-5` (no dot) as a STRING. The trainer casts `lr` with `float()`; anything
+  new that reads a float from the yaml must do the same.
+- The probe's frame-grid readout reports onsets at `o * 5 ms`. The hat's crossing is at
+  `o − 0.5`, and that convention scores ~0.4 f1 lower against TIMIT. `dip_`/`flux_`/`sub_`
+  carry that 2.5 ms handicap.
+- An outside GPU job once emptied the whole queue in two minutes (every arm OOMed);
+  `run_pb02.sh` now waits for free cards.
+- `smoke_test.py` had a stale `sys.path` from the old `modules/` layout (fixed). The same
+  stale line is still in `decoder_sweep.py`, `timit_probe.py` and others: run them with
+  `PYTHONPATH=.` from the repo root.
 
-1. `train_peak_kl` falling? If flat, the model already matches its own targets → the **alignment**
-   is stuck, not the network.
-2. `train_mean_phone_frames` — stuck near `clip_len / n_phones` means it never left the flat
-   start. Try `align_prior_epochs: 4`.
-3. `train_min_dur_frac` high — phones collapsing onto `min_phone_frames`, the degenerate hard-EM
-   solution.
-4. `val_timit_dip_f1_25ms` against its measured random-init floor of ~30 — at the floor, the hat
-   shape never formed.
+**What to read, in this order:**
+
+1. `val_target_entropy_ratio` — must sit at **1.000**. If it falls, the target has started
+   chasing the model's own confidence and everything else is noise. This is the bug that caused
+   the 2026-09-19..22 collapse.
+2. `val_timit_tune_f1_25ms` (the monitor since 2026-09-24) and `val_timit_nobonus_f1_25ms`
+   (the model's own signal): judge both against pa07f's step-1 numbers. The question is the
+   **slope**, not the level.
+3. `val_timit_dip_f1_25ms` — the falsification test: can the model segment with no transcript?
+4. `val_timit_flux_f1_25ms` against the constant `bonusflux_f1_25ms` (60.34) — whether the
+   trunk is keeping or discarding acoustic change.
+5. `val_timit_onset_drift_frames` — decaying means the EM loop converged (possibly to a wrong
+   place); flat or rising means it is still wandering.
+6. `val_frame_acc` rising while the probe falls = self-agreement, not accuracy.
+
+**Best surviving checkpoint:** `pa07f/m_pa07f_epoch=0_step=1246_...73.4052.ckpt` (75.6 holdout
+f1@25 under the final decoder). pa01d e3, the historical best (75.8 headline, 75.4 per-phone),
+was deleted in an earlier cleanup and is gone.
 
 ---
 
-## pa01a post-mortem (diagnosed 2026-09-18, same day) → pa01b
+## The diagnosis that explains 2026-09-19..22
 
-**It was the alignment, not the network.** From pa01a's wandb history and its checkpoints:
+**`soft_target_mix: 1.0` was the drift.** `_soft_target` multiplies the hat by `1 - mix`, so at
+1.0 the hat is not mixed down, it is **arithmetically deleted** — and with it `ramp_frames`, the
+0.5 crossing, and the target's only fixed reference.
 
-- `train_min_dur_frac` 0.61 (epoch 0) → 0.80 → **0.88 from epoch 2 on**, flat thereafter.
-  `val_timit_sub_f1_25ms` 13.0 → **8.3 at epoch 2** (the epoch `align_prior` hit 0) and never
-  moved; that is *below* the 22.7 random-init floor. PER 0.94.
-- The epoch-1 model put **99.8% of TIMIT frames on 2 classes** (ids 53, 30; each ~6% of target
-  phones). Viterbi then gave 90% of phones exactly 2 frames and one phone 320 frames of a
-  14-phone clip. The CE trained on that and locked it in: class-prior collapse, the textbook
-  hard-EM failure on raw posteriors.
-- The diagonal prior did not hold it: at σ=0.1 a one-phone drift costs ~0.01 nats/frame. It
-  holds on a random model, but pa01a had learnt the class bias within ~100 steps, all at lr
-  ~1.5e-5 (`epochs: 100`, see the lr trap above).
-- Measured on 48 TIMIT clips, aligned f1@25 (a **plain uniform split scores 52.4**):
+The hat's entropy is a function of the segmentation GEOMETRY, so it cannot move. The
+occupancy's is a function of the MODEL'S CONFIDENCE, so it shrinks as the model sharpens:
 
-  | checkpoint, prior weight | raw posteriors | `class_prior_norm` |
-  |---|---|---|
-  | step 94, w=0 | 26.0 | 43.4 |
-  | epoch 1 (collapsed), w=0 | 12.6 | 21.8 |
-  | step 94, w=1, σ=0.1 | 33.2 | 46.3 |
-  | step 94, w=1, σ=0.03 | 46.0 | 51.9 |
+    sharper posteriors -> sharper occupancy -> harder target -> sharper posteriors
 
-**pa01b changes**, each a knob whose off-value is pa01a:
+Every self-referential number improved while the only externally-scored one collapsed:
 
-1. `class_prior_norm: true`: Viterbi aligns on `log p(c|x) − log p̄(c)` (batch-mean
-   posterior, 10% uniform smoothing), i.e. hybrid-HMM scaled likelihoods. Alignment only; the CE
-   is unchanged. Also applies to `align_batch` and therefore to the TIMIT probe.
-2. `align_prior_sigma: 0.03`, `align_prior_epochs: 3`, `epochs: 20` (so the flat start runs at
-   a real lr: 1.6e-4 by the end of epoch 3).
-3. `frame_blocks: 4` (`FrameBlock`: pre-LN per-frame MLP, zero-init residual). 5.1M → 13.5M
-   params, **receptive field unchanged at 38.9 ms**. `attn_radius` (banded attention with
-   relative-position bias, counted in the receptive field) exists but is off.
-   Activations 1.79 → 3.53 MB/window, so `batch_size` 200→100 with `accumulate_grad_batches: 2`.
-   `check_batch_feasible` now measures the model instead of using the 1.74 MB constant.
-
-Not independently validated: (1) and (2) are measured on pa01a's posteriors; (3) is reasoned
-from p2cupe's depth, not measured. If pa01b still collapses, look at `train_min_dur_frac`
-first, then the capacity. Also found: `freq_attention` pools over the whole 120 ms window, so
-every frame sees ~1e-4 of the window through the gate. The "38.9 ms" RF is the conv RF, not a
-hard wall.
-
----
-
-## pa01b result → pa01c: the segmental aligner (2026-09-18)
-
-**pa01b**: holdout sub f1@25 peaked at **61.4 at epoch 8, then fell to 57.4 by epoch 19**
-(f1@10 32 → 28): hard-EM self-training drifts once it has converged. Warm-start from the best
-epoch, never `final`. Diagnosis at epoch 8: no systematic offset (median +1 ms, std 21), 22% of
-phones at the 10 ms minimum (TIMIT labels: 0.3%), frame argmax matches its own alignment 45%.
-
-**The aligner, not the model, was the cheap win.** BFA's segmental decoder ideas ported into
-`loss.viterbi_align` (training targets and probe share it), each a knob, off = the old DP
-(verified identical on 360 random clips; new modes optimal against brute force on 145):
-soft duration (min + skippable soft frames), skippable SIL, and a flux onset bonus.
-Tuned on the probe's even-index half, pa01b epoch 8, **held-out half, no retraining**:
-
-| | f1@10 | f1@25 | f1@50 | abs_err |
+| | pa07e e0 | pa08a e0 | pa09a e2 | pa09b e0 |
 |---|---|---|---|---|
-| min 2, nothing else (pa01b as trained) | 33.2 | 62.0 | 79.1 | 21.5 ms |
-| min 6 + 4 soft, SIL skippable, bonus w30 | 54.0 | 72.2 | 83.9 | 14.3 ms |
+| `val_target_entropy` | 0.0859 | 0.0841 | 0.0704 | 0.0703 |
+| `val_frame_acc` | 0.522 | 0.536 | 0.674 | 0.692 |
+| `val_peak_kl` | 1.493 | 1.454 | 1.219 | 1.091 |
+| `val_timit_nobonus_f1_25ms` | 72.66 | 72.23 | 67.77 | **63.55** |
 
-- **The flux bonus only works from the `feature_extractor` tap** (8.9 ms RF). Flux from the
-  context convs, blocks or final embedding adds ~0 — they know what the posteriors know. Same
-  lesson as p2cupe's probe: the boundary lives in the layers that cannot mix time.
-- Once the bonus is on, duration settings move f1@25 by <0.5 and SIL skipping ~0 on TIMIT.
-- A constant per-phone cost is a no-op (every path enters the same phones); only
-  duration-dependent costs can act. `enforce_all_targets=False` (word skips) scored 67.6 vs
-  70.7 forced on TIMIT's matching text — for mismatched transcripts, not a boundary gain.
-- Also fixed: the hat target's partner and `refine_onsets` now use the nearest VISITED phone
-  (a skipped head pad used to receive ~40% of frame 0's target).
-- PER/GER off (`per_enabled: false`); `frame_acc` is the identity guard. The probe now reports
-  the ODD half as `val_timit_*` (ckpt monitor) and the tuning half as `val_timit_tune_*`;
-  numbers are over 200 clips, not comparable 1:1 with earlier 400-clip rows.
+### The fix — three switchable parts
 
-**Open, for pa01c**: training on flux-guided targets is a bet — the tap is trained by the same
-loss, so watch `val_timit_tapflux_f1_25ms` (56.7 at pa01b e8). The bonus weight was still
-rising at 45 on the tune half; the decoder at w30 leans on flux for placement and on the
-posteriors for order, so the model's own boundary sense (`dip_`, ~40) is still weak. Identity
-(45% frame acc, 39 ms RF) is the next lever: the `attn_radius` A/B.
+1. **`soft_onset_mix`** puts the occupancy into the ONSET POSITIONS, not the class
+   distribution. `occupancy_to_onsets` reads `E[onset_i] = sum_t sum_{s<i} gamma[t,s]` (the soft
+   twin of `path_to_onsets`) and its variance off the same survival function; the hat is rebuilt
+   around those fractional onsets via `onsets_to_phone_idx` + `peak_weights`. The hat and its
+   fixed entropy survive, and the target gains sub-frame boundary positions an integer grid
+   cannot carry. **Moments are float64 on purpose**: at T=2000, `E[X^2]` ~ 4e6 against an O(1)
+   variance, and float32 returns a NEGATIVE variance, i.e. NaN sigma.
+2. **EMA teacher** (`ema_decay`): the alignment is built from averaged weights, so a wrong
+   boundary is not confirmed on the very next step. Held in a plain dict, **not** as a module
+   attribute — `nn.Module.__setattr__` would register it, put it in the `state_dict` and break
+   every older checkpoint. Pick the decay from the step count the run prints, not by feel:
+   `limit_data` caps FILES while the dataset is SEGMENTS, so 10000 files is ~176 optimiser
+   steps/epoch, not the ~23 the clip count suggests.
+3. **`repr_flux_weight`**: keeps the embedding's frame-to-frame change correlated with log-mel
+   change (Pearson per clip — shape only, bounded in [0, 2]). See "the wall" below.
 
-**pa01c result**: holdout sub f1@25 peaked at epoch 1 (73.2) and slid to 72.2 by epoch 8 — the
-decoder alone gave 72.2 on pa01b e8, so retraining on segmental targets bought ~1 point. The
-learned tap flux eroded as predicted (56.6 → 54.1) while `frame_acc` rose (38.9 → 41.9%): the
-front end specialises for identity and loses change sensitivity.
+`aug_views` / `aug_warp_range` (target onsets averaged over time-warped views, with the law of
+total variance widening the ramp where views disagree) is implemented, **default off, never
+measured**.
 
-**→ pa01d: onset bonus from log-mel flux** (`boundary_flux_source: mel`, L2 change of 80-bin
-log-mel on the 5 ms grid; no parameters, cannot drift). pa01c e1 holdout: tap 54.7/73.0/84.5 →
-mel **57.4/74.8/84.9** (f1@10/25/50). Cosine on log-mel was worse (46/69); L2 keeps loudness.
-
-**⚠ The floor moved.** Random init, holdout, pa01d decoder: f1@25 **69.9** with the mel bonus,
-52.0 without. pa01c e1: 74.8 with, 71.6 without. The headline is mostly the aligner; the
-probe's `nobonus_f1_25ms` is the model's own learning signal. Judge pa01d on that.
-
-pa01d: `libri_500h` (538k segments, 408 h after filtering), warm start pa01c e1, lr 5e-5,
-4 epochs, batch 108 (dev run: 44.9 GB reserved).
-
-**pa01d result** (4 epochs): headline flat 75.8–76.1 (holdout sampling error ~±0.8), `nobonus`
-73.5 → 74.4 (e2) → 74.0, `frame_acc` 38 → 43%, val_loss 2.64 → 2.43. Identity keeps improving;
-placement does not follow. Use e3.
-
-## Where the gap to MFA is (2026-09-19, `error_breakdown.py`, pa01d e3, 400 probe clips)
-
-Same clips, same scorer: MFA 79.1 f1@25, pa01d 75.8. Per boundary type (recall@25):
-
-- **Stops: a convention difference, not an error.** pa01d starts a stop at its BURST, MFA (and
-  TIMIT's phone convention) at its CLOSURE. TIMIT labels both (`tcl`, `t`), so each aligner gets
-  one of the two: closure→burst 83 vs 18. It costs the vowel after the stop (stop→vowel 47 vs 81)
-  because the min duration pushes it late.
-- **Real gap: gradual transitions** — vowel onsets 67 vs 86 (n=4444), lateral 57 vs 77,
-  rhotic→vowel 54 vs 81, glide→vowel 51 vs 78. The flux bonus cannot see these: it HELPS abrupt
-  onsets (closure→burst +40, affricates +31, stops +17) and HURTS every entry into a vowel (−6.4
-  overall, stop→vowel −14). With the bonus OFF, vowel onsets are 73.6 vs MFA 86.3 — that is
-  the posteriors' limit, i.e. the acoustic model.
-- **Rejected:** a smaller bonus on vowel entries (`vowel_scale`, tune half): 0.5 → +0.3 (noise),
-  0.25 → −1.4, 0 → −3.5. Effects are not additive per class: remove the pull on the vowel and the
-  same flux peak drags the neighbouring consonant boundary onto it. Code reverted.
-- Not pursued (flag, don't chase): emitting closure AND burst for stops would add ~10 recall
-  points on TIMIT, but that is TIMIT's labelling convention, not MFA-style alignment.
-
-## A/B: context for identity (pa02a, 2026-09-19) — NULL RESULT, attention not adopted
-
-`cupe_hp_ab_ctrl.yaml` vs `cupe_hp_ab_attn.yaml`, both warm from pa01d e3, 2 epochs libri_500h,
-lr 5e-5, effective batch 432. The attention arm GROWS pa01d via `warm_start_arch_overrides:
-[attn_radius]` (trainer.on_load_checkpoint): radius 1 in all 4 blocks, RF 38.9 → 78.9 ms,
-13.5M → 17.8M params, zero-initialised outputs — verified logit-identical to pa01d at step 0.
-Attention arm runs at batch 72 × 3 (37.2 GB, 78% — the CPU-calibrated check over-predicts
-attention at 88%). Decide on `nobonus_f1_25ms`, then the headline, then `error_breakdown.py`'s
-vowel/lateral/rhotic/glide rows. Logs: `tmp/training/p3cupe/pa02a_{ctrl,attn}.log`.
-
-Result (epoch 1 of each; holdout probe, then error_breakdown on all 400 clips):
-
-| | ctrl | attn |
-|---|---|---|
-| val_frame_acc | 44.6% | 45.7% |
-| val_loss / peak_ce | 2.361 / 1.917 | 2.315 / 1.877 |
-| holdout sub f1@25 (e0 / e1) | 75.92 / 75.92 | 75.63 / 75.50 |
-| holdout nobonus f1@25 (e1) | 73.83 | 74.16 |
-| 400-clip f1@25, bonus 30 / 0 | 75.6 / 73.3 | 75.6 / 73.7 |
-| vowel / lateral / rhotic / glide @25 (bonus 0) | 73.7 / 60.2 / 71.4 / 67.8 | 74.1 / 59.3 / 71.3 / 66.4 |
-
-- Attention buys ~1 point of frame accuracy and lower CE, but the boundaries don't move. Every
-  class row is within ±1.5 (noise), and the gradual-transition gap to MFA is unchanged.
-  Epochs are 35% slower (95 vs 71 min). Not adopted.
-- Neither arm beat pa01d e3 (76.0). Continued hard-EM training on the same objective has
-  plateaued since pa01d e1-e3. Better phone identity (frame acc) no longer translates into
-  boundary placement. The limit is the self-training target: Viterbi on the model's own
-  posteriors reproduces its own boundary bias. It is not capacity or context.
-
-## Why the boundaries miss (miss_breakdown.py, pa01d e3, 400 clips, 2026-09-19)
-
-`miss_breakdown.py` matches phone sequences (broad class + time) instead of boundaries, so
-each TIMIT phone onset lands in one bucket. Closures are merged into their release, so a stop
-onset is scored at the closure. MFA is scored the same way as a reference (evaluation only).
-
-| hit@25 per phone onset | p3 bonus 30 | p3 bonus 0 | MFA |
-|---|---|---|---|
-| ALL | 67.8 | 74.8 | 83.7 |
-| vowel | 68.9 | 78.2 | 87.0 |
-| reduced vowel after stop | 46.4 | 76.9 | 87.7 |
-| rhotic / lateral / glide | 49 / 48 / 55 | 58 / 53 / 53 | 73 / 73 / 84 |
-
-- NOT the cause:
-  - Sequence mismatch: wrong_class + no_match is 3.5% for p3 vs 4.2% for MFA. The ~10% of
-    stops with no match is TIMIT q and extra closures, and hits both aligners equally.
-  - Path drift: far_run is 1.5% with bonus 0, and misses are spread evenly across clips.
-  - The duration floor, mostly: 6.3% of TIMIT phones are shorter than 30 ms, the same limit as
-    MFA's 3 x 10 ms HMM. It binds in 28% of p3's non-hit misses vs 16% of MFA's. Secondary.
-- The cause is LOCAL placement:
-  - near misses (25-50 ms): 14.2% vs MFA 9.6%.
-  - isolated far misses: 6.0% vs 2.4%.
-  - Worst at gradual transitions: glides 53 vs 84; far_single on glides 17% vs 2%.
-- **The onset bonus hurts real phone onsets.** Per phone it costs 7 points overall, 9 on
-  vowels and 30 on reduced vowels after stops. Far misses skew early (929 early vs 561 late):
-  it pulls onsets onto bursts. Its gain in the `levenshtein_align` headline comes from TIMIT's
-  extra closure->burst boundaries, which are not phone onsets in the transcript. The headline
-  rewards it for the wrong reason.
-- The bonus is also in the TRAINING targets (PeakLoss bonus_weight 30), so the model has been
-  self-training toward burst-snapped boundaries.
-
-## Decoder-only sweep (decoder_sweep.py, pa01d e3, 2026-09-19)
-
-Grid on the tune half: bonus {0,1,3,10,30} x min_phone_frames {3..10} x soft {0..14}.
-
-- The bonus is monotonically worse per phone. Each step down is better:
-  30 -> 10 -> 3 -> 1 -> 0 gives 68.0 -> 70.1 -> 71.6 -> 73.4 -> 74.6.
-  The lev headline moves the opposite way (75.8 -> 73.3), because it credits closure->burst.
-- The duration floor is not a lever. Shorter than 6 frames always hurts (min 3 is -3 points).
-  Longer plateaus: 6+6 and 6+8 give 74.8-74.9 vs 74.6 at the trained 6+4, which is noise.
-  Lowering the floor to 20-25 ms, the hypothesis from the miss breakdown, is rejected.
-- Holdout confirmation, per-phone phone@25 (lev f1@25):
-
-  | setting | phone@25 | lev f1@25 |
-  |---|---|---|
-  | bonus 30, 6+4 (current) | 68.3 | 75.8 |
-  | bonus 0, 6+4 | 75.4 | 74.1 |
-  | bonus 0, 6+6 | 75.4 | 74.3 |
-
-  Per class, bonus 0 vs 30: vowel 78.8 vs 68.9, rhotic 61 vs 50, stop 77 vs 67, nasal 84 vs 79,
-  lateral 51 vs 48. Glide is the only class that prefers the bonus (51 vs 53); fricative is flat.
-- Conclusion: decode with bonus 0. The remaining gap to MFA's 83.7 is the model's local
-  placement at gradual transitions (glides, laterals, rhotics). The next test is training
-  targets built without the bonus.
-
-## pa03a: training targets without the bonus (2026-09-19) — WORSE, declined every epoch
-
-| holdout | pa01d e3 (start) | pa03a e0 | e1 | e5/final |
-|---|---|---|---|---|
-| nobonus lev f1@25 | 74.0 | 72.1 | 71.6 | 69.8 |
-| per-phone phone@25 (bonus 0) | 75.4 | 74.5 | 74.2 | 72.6 |
-| sub f1@10 | ~58 | 42.7 | 41.4 | 39.3 |
-
-- Meanwhile val_frame_acc rose 44.6% -> 53.0%, val_loss fell 2.36 -> 1.99, and
-  val_min_dur_frac went 0.118 -> 0.202: many more phones squeezed to the 6-frame floor.
-  The model is agreeing better with its OWN alignments while real boundaries get worse.
-  This is hard-EM drift; frame_acc is self-agreement, not accuracy.
-- Final per class, bonus 0: rhotic up (61 -> 64); vowel, nasal and fricative down 3-5; glide and
-  lateral flat. Near misses grew (14.2% -> 16.6%).
-- Every warm-started continuation has declined: pa01b after e2, pa01d's later epochs, both
-  pa02a arms, pa03a. The bonus in the targets SLOWED the drift (it is a fixed external
-  anchor); removing it sped it up. The best model is still pa01d e3 DECODED with bonus 0.
-- Also tested, decode-only on pa01d e3: the bonus on obstruent entries only (pg16 6-11, with
-  and without SIL). Vowels recover, but stop onsets are dragged to the burst (stop 41-59 at
-  w 10-30). Never beats bonus 0 (74.6 tune). Code reverted.
-- `last.ckpt` is the last MONITORED checkpoint, not the final epoch; the final weights are
-  `m_<exp>_final_e<N>.pt` (same format, loadable by the analysis scripts).
-
-## pa03b: pa03a + stronger duration prior, 1 epoch (2026-09-19) — mixed
-
-soft_phone_frames 8, soft_frame_cost 2.0 in both training alignment and decode, bonus 0,
-libri_100h, warm from pa01d e3.
-
-- Holdout, bonus 0:
-  - phone@25: 75.1 (start 75.4, pa03a e0 74.5); lev 72.0 (start 74.0).
-  - Per class: lateral 51 -> 57, rhotic 61 -> 65, fricative 81 -> 78; vowel, glide, nasal and
-    stop roughly flat.
-  - sub f1@10: 45.5 -> 39.8; precision is falling.
-- min_dur_frac 0.166 (start 0.118): the squeeze is reduced but not stopped.
-- Reading: removing the bonus from the targets helps the gradual classes but loses sharpness,
-  and the duration prior only slows the squeeze.
-- Proposed next: pa03c = bonus 30 in the training targets (anchor) + soft 8 / 2.0, judged
-  decoded with bonus 0. If it doesn't beat 75.4 per phone, stop warm-continuing pa01d.
-- Gotcha: a dev run writes `m_<exp>_final_e1.pt` under the same experiment name, so don't
-  wait on that file to detect the end of a real run. Wait for the process to exit instead.
-
-## pa03c: bonus 30 in the targets + soft 8 / 2.0, 1 epoch (2026-09-19) — below start
-
-- min_dur_frac 0.107 (start 0.118): the squeeze is STOPPED.
-- frame_acc 43.7%: no self-agreement inflation.
-- The boundaries are still slightly worse:
-  - phone@25, bonus 0: holdout 74.3, tune 74.1 (start 75.4 / 74.6).
-  - lev nobonus 73.1 (start 74.0).
-  - Holdout per class: rhotic 62 and lateral 55 keep part of pa03b's gain; nasal 81 (from
-    84), glide 49, fricative 81 (flat).
-- Conclusion: the squeeze was a symptom, not the cause. Every variant of the target
-  recipe (bonus on/off, duration prior, attention, more data, same recipe continued) ends at
-  or below pa01d e3. pa01d e3 is this hard-EM loop's fixed point, and a different target
-  recipe just moves it to a nearby, no-better point.
-- STOP warm-continuing pa01d with target tweaks. Best model: pa01d e3 decoded with bonus 0
-  (75.4 per phone holdout, MFA 83.7). The next lever is HOW the targets are built.
-
-## Soft targets / soft-EM (2026-09-19) — implemented, pa04a running
-
-- `loss.alignment_occupancy`: forward-backward on the SAME segmental decoder. The shared
-  setup is `_segmental_topology`, also used by viterbi_align. Occupancy = d logZ / d emission
-  (autograd; no hand-written backward pass).
-- Verified on pa01d TIMIT posteriors:
-  - refactored Viterbi bit-identical on 16/16 clips (with bonus, without, and with prior);
-  - occupancy rows sum to 1;
-  - scale 50 -> argmax == Viterbi on 99.75-100% of frames;
-  - mix 0 loss, gradients and stats identical to the old code.
-- Sharpness: at scale 1 the occupancy is nearly one-hot (mean peak 0.95 bonus 0, 0.99 bonus
-  30). Posterior-mean decoding (decoder_sweep.py --occupancy-scale) holds the Viterbi
-  per-phone score down to scale 0.3 (74.7 vs 74.6 tune), then degrades (0.1: 72.9; 0.05: 69.7).
-  Scale 1 posterior-mean decoding gives 74.9 (noise-level over Viterbi).
-- Cost: 1.6 s per 108 x 2000-frame batch at chunk 128 (Viterbi 1.1 s), +1.4 GB. The dev run
-  peaked at 37.1 GB allocated / 45.4 reserved; nvidia-smi shows 47.5 GB in training.
-- hp: `soft_target_mix` (0 = hat only), `soft_target_scale` (default 0.3).
-- pa04a (`cupe_hp_pa04a.yaml`) = the pa02a_ctrl recipe (bonus 30, soft 4 / 1.0) +
-  soft_target_mix 1.0, scale 0.3; libri_100h, 1 epoch, warm from pa01d e3. Judge per phone
-  with bonus 0 against 75.4 holdout / 74.6 tune.
-
-### pa04a result — soft-EM does not help; the misses are CONFIDENT
-
-- Standard metrics were stable for once: holdout headline 75.9 (start 76.0), nobonus 73.8
-  (74.0), sub f1@10 58.9 (58.6). min_dur_frac 0.122 (no squeeze).
-- Per phone, bonus 0: holdout 74.1 (start 75.4), tune 74.3 (start 74.6). Vowel 76.3 vs 78.8 and
-  glide 46.6 vs 51 on holdout. Not better.
-- Caveat: at scale 0.3 the target entropy was 0.09, LOWER than the hat's 0.17, so pa04a mostly
-  tested "no ramp", not "keep the uncertainty".
-- The decisive diagnostic (scratch `onset_confidence.py`, pa01d e3, 400 clips, bonus 0):
-  - Each onset's posterior std comes from the occupancy CDF.
-  - At scale 1, 66% of far misses (>50 ms) have std < 10 ms (vowels 71%, rhotics 75%,
-    laterals 74%). The median std is 0 ms even for near misses.
-  - At scale 0.3 the std grows with the error (7.6 / 10.9 / 16.9 ms for hit / near / far) but
-    stays ~13 ms for vowel far misses, far short of the error.
-  - The model is confidently wrong, so no re-weighting of its own beliefs can move those
-    boundaries. Soft-EM, like every earlier target tweak, is capped here.
-- Remaining levers are in the acoustic evidence itself (user to choose):
-  - speaker normalisation (MFA's speaker-adapted second pass);
-  - context-dependent / transition modelling (MFA's triphone states), since we have one class
-    per phone at gradual transitions.
-- The code stays: soft_target_mix defaults to 0 (off); verified and documented in loss.py.
-
-## Cleanup (2026-09-19, after commit 8961c4d)
-
-- Removed the experiment configs cupe_hp_ab_ctrl / ab_attn / pa03a / pa03b / pa03c / pa04a.yaml
-  (recoverable from 8961c4d).
-- Deleted the checkpoints of pa02a_*, pa03a-c and pa04a (their results are all recorded here).
-- Kept pa01a-d; pa01d e3 is the warm-start source and the current best.
-- Tools kept: error_breakdown.py, miss_breakdown.py, decoder_sweep.py.
-
-## Sub-phone states (pa05a, running 2026-09-19) — user-requested, may be rolled back
-
-The user asked for MFA's "tri-phone strategy": 2 states for short phonemes, 3 for long, and a
-loss that punishes out-of-order states. It was tried before with model3a and did not work, but
-the model is now very different.
-
-NB this is MFA's multi-STATE phone topology, not context-dependent triphones.
-
-- `states.py` (StateInventory):
-  - 185 state classes. SIL and noise get 1 state; stops (pg16 6, 7), glides (15), h and the
-    tap get 2; everything else 3. SIL is state 0.
-  - `expand` turns phone sequences into state sequences, so the unchanged segmental decoder
-    aligns states.
-  - `collapse` turns a state alignment back into phones: a phone's onset is its first state's.
-  - `phone_log_probs` = log-sum-exp over a phone's states.
-  - `order_penalty` = mass on state k of phone p at t times mass on its states j < k at
-    t + lag (lags 1-2).
-  - Self-test: in order 0, reversed 0.4.
-- Model: `phone_states` config key; classes_dim = 185.
-- Trainer:
-  - `forward` expands targets and adds order_loss_weight * order penalty (logs `order_mass`).
-  - `align_batch` aligns states and collapses them to phones (refinement reads phone
-    posteriors). The probe's dip readout uses phone posteriors.
-  - The duration knobs come from state_min_frames / state_soft_frames (2 / 1).
-- Warm start: `phone_states` is the one CONVERTIBLE key in warm_start_arch_overrides. The
-  classifier's phone rows are copied to their states with the bias lowered by log(n_states).
-  Verified: the state model's phone posteriors equal pa01d's (max diff 7.6e-6), and the dip
-  readout is identical.
-- Step-0 probe with 100 clips: f1@25 74.8 vs pa01d 75.6. The states start identical, so the
-  split between them is arbitrary; the dev run gives nobonus 73.7.
-- pa05a (`cupe_hp_pa05a.yaml`): the pa01d recipe + phone_states, libri_100h, 2 epochs (the new
-  head needs steps to separate its states), monitor nobonus. Judge per phone with bonus 0
-  against 75.4 holdout / 74.6 tune.
-- Rollback: set `phone_states: false` (the default). Phone mode is unchanged (smoke test passes).
-
-### pa05a result — FIRST gain over pa01d per phone, and still improving with training
-
-- Standard probe at the trained 2+1: nobonus 73.3 (pa01d 74.0), headline 74.0. The dip
-  readout fell to 38.6 (43.3).
-- order_mass 0.083 -> 0.051 (val); min_dur_frac 0.34 (per STATE, not comparable).
-- Per phone, bonus 0 (decoder_sweep --min/--soft are PER STATE here):
-
-  | | tune | holdout |
-  |---|---|---|
-  | pa01d best decode | 74.9 | 75.4 |
-  | pa05a at the trained 2+1 | 75.4 | 75.7 |
-  | pa05a at 3+1 (best on tune) | 76.5 | 76.2 |
-
-  - 3+2 is equal; 3+3 and up slowly lower; min 4 collapses to 72.
-  - A longer floor does NOT explain it: pa01d at 8-10 phone frames gets 74.5 / 73.3.
-- Epoch 1 -> 2 on tune at 3+2: 76.1 -> 76.4. Improving, unlike every hard-EM continuation.
-- Holdout per class at 3+1 vs pa01d:
-  - better: vowel 81.5 vs 78.8, lateral 56.3 vs 51.3, stop 78.4 vs 76.8, rhotic 62.0 vs 60.9;
-  - worse: nasal 79.2 vs 84.0, fricative 79.6 vs 81.1;
-  - flat: glide ~50 (MFA 84).
-- Proposed next, pa05b: continue from pa05a e2 with state_min_frames 3 / soft 1 so training
-  matches the best decode. Watch nasals (a 2-state nasal is a one-line change).
-
-### pa05b: pa05a e2 + TRAINING at 3+1 per state, 2 epochs — WORSE, drift is back
-
-- Per phone at 3+1: tune 76.5 (start) -> 76.0 (e1) -> 75.5 (e2); holdout 76.2 -> 75.5.
-- nobonus 73.4 -> 73.3; min_dur_frac 0.34 -> 0.40 (state-level squeeze); order_mass 0.051 -> 0.047.
-- Nasals keep falling: pa01d 84.0 -> pa05a 79.2 -> pa05b 76.3 (tune). Vowels and laterals keep
-  most of their gain.
-- BEST so far: pa05a e2 (`pa05a/m_pa05a_epoch=1_step=500_...73.3032.ckpt`) decoded at
-  state_min_frames 3 / soft 1: 76.2 holdout, 76.5 tune per phone (MFA 83.7).
-- Proposed: pa05c = pa05a repeated with NASALS as 2-state phones (12% of TIMIT nasals are
-  < 30 ms). If it doesn't beat pa05a, stop and make pa05a e2 + 3/1 decoding the recipe.
-
-### ROLLED BACK (2026-09-19, user)
-
-The user judged every post-commit change worthless and asked to return to single-state phones.
-- model.py, trainer.py, timit_probe.py and decoder_sweep.py were restored from 8961c4d.
-- states.py, cupe_hp_pa05a/b.yaml and the pa05a/b checkpoints were deleted.
-- The pa05 notes above are the only record left.
-
-## pa06: wider window + per-frame context, English vs multilingual (running 2026-09-19)
-
-User's question: is more context bad for MULTILINGUAL performance? MLS_7l_100h has no English.
-The user chose: warm start from pa01d e3, no 120 ms baseline runs, and widen the per-frame
-context as well as the window.
-
-- Why both: the per-frame receptive field was 38.9 ms whatever the window. Windows are
-  processed independently and stitched; only `freq_attention` (a per-window channel gate)
-  pools the whole window.
-- trainer: `GEOMETRY_KEYS` (window_size_ms, window_stride_ms) are now allowed in
-  `warm_start_arch_overrides`. No weight depends on the window, so pa01d loads unchanged; the
-  model config's input_wav_length follows the yaml.
-- pa06a (libri_100h) and pa06b (MLS_7l_100h) are identical apart from data_src:
-  - window 360 / stride 180, attn_radius 4 in all 4 blocks: RF 198.9 ms, 17.75M params;
-  - 2 epochs, lr 5e-5, bonus 30 (pa01d recipe), monitor nobonus;
-  - batch 72 x accumulate 3 x 2 GPUs = 432. Batch 54 measured 33.6 GB reserved, although the
-    startup check said 95%: it over-predicts attention again. 72 measured 44.7 GB (93%).
-- Step 0 (the dev run, before any training): re-windowing alone costs ~2 points. Headline
-  74.8 vs pa01d 76.0; nobonus 71.9 vs 74.0. The per-window gate now pools 360 ms, and the
-  stitch changed.
-- Judge on the TIMIT probe (English) for both, per phone with bonus 0 (decoder_sweep). pa06b
-  is then an English test of an MLS-trained model, i.e. cross-lingual.
-
-### pa06 result and cleanup (user, 2026-09-19)
-
-- pa06a (libri, 360 ms + attention) was not much better than 120 ms. pa06b (MLS) was stopped
-  after 1 epoch at 156 min/epoch; holdout sub f1@10 55.3, f1@25 71.6.
-- Decision: stay at 120 ms windows. The pa06 configs, checkpoints and trainer window override
-  are removed; trainer.py is back to 8961c4d.
-- MLS_7l_100h is ~6.5x libri_100h per epoch: 1614 vs 250 optimiser steps at an effective
-  batch of 432.
-
-## pa07a: the pa04a recipe on MLS, 10 epochs (master cupe_hp.yaml, 2026-09-19)
-
-- The user picked pa04a as best from the wandb table (probe headline). Its checkpoints had been
-  deleted in the cleanup, so the recipe was recreated from `git show
-  8961c4d:modules/p3cupe/cupe_hp_pa04a.yaml`.
-- cupe_hp.yaml is now that recipe with data_src MLS_7l_100h, epochs 10, warm from pa01d e3:
-  soft_target_mix 1.0, scale 0.3, bonus 30, 120 ms windows, batch 108 x 2, monitor nobonus.
-- Dev run OK: 45.5 GB reserved; the step-0 probe equals pa01d.
-- Expected time: ~2.4 h/epoch (pa04a's ~5.4 s/step x 1614 steps), so ~24 h for 10 epochs.
-  The user starts it.
-
-### f1@10 vs MFA — check before using it as a selling point (pa01d e3, same 400 clips)
-
-| | all TIMIT boundaries @10/25/50 | without closure->burst @10/25/50 |
-|---|---|---|
-| p3 bonus 30, sub-frame (probe readout) | 58.9 / 75.7 / 85.2 | 52.1 / 71.8 / 85.7 |
-| p3 bonus 0, sub-frame | 46.8 / 73.2 / 85.6 | 46.8 / 75.0 / 87.9 |
-| MFA | 53.6 / 79.1 / 88.5 | 57.7 / 83.4 / 91.7 |
-
-- MFA's 53.6 on these 400 clips matches its full-TIMIT 53.65, so the comparison is sound on
-  the standard scorer: p3 leads by +5.3 at @10.
-- The lead comes from TIMIT's extra closure->burst boundaries, which the flux bonus places
-  within 10 ms. Scored on phone onsets only, MFA leads at every tolerance (57.7 vs 52.1 at
-  @10).
-- The claim holds on the standard benchmark (every aligner scored the same way), but it rests
-  on the burst convention.
-
-### pa03a setup (for reference)
-
-`cupe_hp_pa03a.yaml`: warm from pa01d e3, libri_100h (user: faster to iterate), 6 epochs
-(~1/5 the steps per epoch of 500h), lr 5e-5, boundary_bonus_weight 0, ckpt_monitor
-val_timit_nobonus_f1_25ms. Everything else is as in pa02a_ctrl. Starting point: nobonus 74.0
-holdout; per-phone 75.4 (decoder_sweep.py). Judge the result with decoder_sweep.py /
-miss_breakdown.py (bonus 0), especially glide/lateral/rhotic. Checkpoint differences are small,
-so read the trend rather than the pick (user). Log: `tmp/training/p3cupe/pa03a.log`.
+**Regression gate:** at `soft_onset_mix: 0, ema_decay: 0, repr_flux_weight: 0` the loss,
+gradients and stats are **bit-identical** to the pre-change code across five configurations
+(checked against `git show HEAD:p3cupe/loss.py`, including the old `soft_target_mix: 1.0`
+path). Keep that property — it is what makes any A/B here readable.
 
 ---
 
-## The loss — what was chosen and why
+## Results since the fix
 
-**The end goal is MFA-style boundary alignment from sequence labels only.** So the model is
-trained to make its *own posteriors carry the boundary*, rather than to emit a label sequence
-from which a boundary must afterwards be recovered.
+**pb01a** (soft onsets + EMA teacher, ramp 3.0, `soft_onset_ramp_k: 1.0`, 10 epochs):
+
+| ep | nobonus@25 | sub@25 | sub@10 | dip@25 | drift |
+|---|---|---|---|---|---|
+| 0 | 71.76 | 73.91 | 57.53 | 39.98 | – |
+| 4 | 70.33 | 73.16 | 56.26 | 37.46 | 0.27 |
+| 9 | 70.49 | 73.22 | 55.90 | 35.81 | 0.37 |
+
+- **The runaway is gone.** `target_entropy_ratio` pinned at 1.000; `frame_acc` +0.01 over 10
+  epochs (was +0.17); `peak_kl` −0.015 (was −0.40); `min_dur_frac` 0.104 → 0.107, no squeeze.
+  Decline went from −4.2/epoch (pa09b) and −1.0/epoch (pa09a) to **−0.13/epoch, flat from e4**.
+- **But it does not improve**, and it starts 1.6 below the warm start — switching away from a
+  near-one-hot target costs that on the first epoch.
+- **`soft_onset_ramp_k: 1.0` is harmful; set to 0.** `onset_sigma_frames` ~1.3, so ramps ran
+  ~4.3 frames instead of 3, and both SHARPNESS readouts fell monotonically for it (dip 40.0 →
+  35.8, sub f1@10 57.5 → 55.9) while the tolerant no-bonus f1 merely plateaued. This was the
+  "keep the uncertainty" variant pa04a never tested. It is now tested: it buys nothing.
+- **`onset_drift` does not decay** (0.21 e3 → 0.39 e8, p95 2.0) while every metric is flat: the
+  loop wanders across segmentations that are equally self-consistent and equally mediocre.
+
+**pb01b** (ramp 2.0, `soft_onset_ramp_k: 0`, `repr_flux_weight: 1.0`), epochs 0–3:
+
+| ep | nobonus@25 | sub@25 | sub@10 | dip@25 | **flux@25** | drift |
+|---|---|---|---|---|---|---|
+| 0 | 72.95 | 74.85 | 58.90 | 40.02 | 60.14 | – |
+| 1 | 72.44 | 74.51 | 58.08 | 38.48 | 62.26 | 0.50 |
+| 2 | 72.18 | 73.94 | 57.37 | 35.76 | 62.25 | 0.37 |
+| 3 | 72.25 | 74.10 | 57.66 | 37.04 | 62.76 | 0.33 |
+
+- Narrowing the ramp and dropping the widening **recovered ~1.2 points of starting level**
+  (72.95 against pb01a's 71.76) and holds a better level throughout.
+- **The representation term does exactly what it was built to do.** `flux_f1@25` — the
+  embedding's own transcript-free boundary signal — goes 60.14 → 62.76 and is for the first
+  time in this lineage **above the parameter-free log-mel flux (60.34)**. In pb01a the same
+  number FELL, 53.9 → 51.8. `repr_flux_corr` rises (user-observed at e4).
+- **And none of it reaches the posteriors.** `dip@25` still 40.0 → 37.0, `nobonus` still
+  drifting down ~0.2/epoch. See below.
+
+**pb02a** (pb01b + `local_delta: 1`), 10 epochs, completed 2026-09-23:
+
+| ep | nobonus@25 | frame-grid@25 | dip@25 | flux@25 | pb01b nobonus / dip |
+|---|---|---|---|---|---|
+| 0 | 72.97 | 74.72 | 40.34 | 60.17 | 72.95 / 40.02 |
+| 1 | 72.34 | 74.41 | 38.64 | 62.31 | 72.44 / 38.48 |
+| 2 | 72.23 | 73.89 | 35.22 | 62.35 | 72.18 / 35.76 |
+| 3 | 72.30 | 73.83 | 37.71 | 62.45 | 72.25 / 37.04 |
+| 6 | 72.20 | 73.57 | 33.59 | 62.77 | – |
+| 9 | 71.79 | 73.38 | 34.49 | 62.16 | – |
+
+- **The head USED the branch and it changed nothing.** `train_delta_share` ended at 0.18
+  (the delta branch is 18% of the hidden pre-activation), yet epochs 0–3 match pb01b to within
+  noise on every readout. The same slow decline continues to e9 (nobonus −1.2, dip −5.9).
+- This **falsifies "the head cannot see the change"** as the reason the dip does not follow
+  flux. Given the change directly, the classifier spends it on something the hat target
+  rewards, not on a dip. So the bottleneck is the OBJECTIVE, not what the head can see: the hat
+  asks for flat posteriors in the phone interior and a crossing ±2 frames wide, and a sharper
+  crossing gives a NARROWER dip, not a deeper one. The dip readout may be the wrong instrument
+  for a model that fits the hat better. Read frame-grid and sub f1 before treating dip as
+  ground truth. They fell too (74.7 → 73.4), so this is not only an instrument effect.
+- End state: `target_entropy_ratio` 1.000, `repr_flux_corr` 0.88, `frame_acc` 0.60,
+  `onset_drift` 0.43 (p95 2), `min_dur_frac` 0.108. No runaway and no squeeze.
+- Verdict: leave `local_delta` at 0 unless a later objective change gives the head a reason
+  to use it. The other pb02 arms first ran into an outside 42 GB GPU job and OOMed within
+  20 s. They were relaunched at 14:59; `run_pb02.sh` now waits for free cards.
+
+**pb02 sweep** (all warm from pa07f, 10 epochs, one knob off pb01b; e0 → e9, TIMIT holdout f1@25):
+
+| arm | change | nobonus | frame-grid | dip | flux | peak_ce |
+|---|---|---|---|---|---|---|
+| pb02f | control | 72.95 → 72.23 | 74.70 → 73.84 | 40.0 → 33.1 | 60.1 → 62.5 | 1.372 |
+| pb02a | `local_delta: 1` | 72.97 → 71.79 | 74.72 → 73.38 | 40.3 → 34.5 | 60.2 → 62.2 | 1.316 |
+| pb02b | ramp 3.0 | 72.63 → 71.42 | 74.45 → 73.27 | 40.8 → 34.6 | 60.0 → 62.3 | 1.419 |
+| pb02e | ramp 4.0 | 72.14 → 70.73 | 74.22 → 72.94 | 40.9 → 35.4 | 59.5 → 62.2 | 1.468 |
+| pb02c | repr 3.0 | **73.32** → **72.43** | **75.01** → 73.78 | 40.0 → 33.9 | 62.7 → 62.5 (peak 63.3) | 1.386 |
+| pb02d | repr 0.3 | 72.59 → 72.31 | 74.61 → 73.57 | 39.5 → 33.7 | 57.8 → 62.1 | 1.364 |
+
+- **No arm improves on the warm start.** pa07f e0 is 73.41; the best any arm reached is 73.32
+  (pb02c e0). Every arm declines after epoch 0, whatever the knob. The decline belongs to the
+  training loop itself, not to any setting tested.
+- **The receptive-field-floor hypothesis is refuted.** Wider ramps are monotonically WORSE on
+  every tolerant readout (e0 nobonus: ramp 2.0 72.95 > 3.0 72.63 > 4.0 72.14, same at e9).
+  Only the dip improves slightly with width, and that is the instrument: a wider hat means a
+  wider dip. If anything, the trend points NARROWER (1.5) - untested.
+- **Dip does not follow flux, at any weight.** Final dip sits at 33–35 in every arm, while final
+  flux spans 62.1–62.5 and peak flux 62.1–63.3. At repr 0.3 flux starts BELOW log-mel (57.8)
+  and still climbs to 62.1, so part of that rise comes from the loop, not the term.
+- **repr 3.0 is the only weak positive:** +0.37 at e0, +0.20 at e9 over control, with no
+  identity cost visible (peak_ce 1.386 against 1.372). Within what one seed can resolve? Unknown -
+  no seed replicate exists.
+- All arms were healthy: `target_entropy_ratio` 1.000, `min_dur_frac` 0.108–0.110,
+  `onset_drift` 0.34–0.43.
+
+**pb02g** (control + `lr: 1e-5`, 5× lower), 10 epochs, 2026-09-24:
+
+| ep | 0 | 1 | 2 | 3 | 5 | 7 | 9 |
+|---|---|---|---|---|---|---|---|
+| nobonus, lr 1e-5 | 73.11 | 73.00 | 72.72 | 72.41 | 72.15 | 72.34 | 71.98 |
+| nobonus, lr 5e-5 (pb02f) | 72.95 | 72.44 | 72.18 | 72.25 | 72.25 | 71.92 | 72.23 |
+| dip, lr 1e-5 | 39.0 | 40.1 | 39.9 | 39.8 | 37.0 | 36.1 | 35.6 |
+
+- **The decline is NOT proportional to lr; the loop has an ATTRACTOR.** With a 5× smaller step
+  budget the run leaves the warm start more slowly (dip holds ~40 to e3, onset_drift 0.19
+  against ~0.37) but ends at the same place: nobonus 71.98 against 72.23, frame-grid 73.75
+  against 73.84, dip 35.6 against 33.1. Even the first low-lr epoch loses 0.3 (73.41 → 73.11).
+- Across all seven pb02 arms, the e9 no-bonus lands in 70.7–72.4. The knobs move the level of
+  the fixed point a little (ramp width moves it most); nothing tested moves it above the
+  warm start. **The current objective's equilibrium sits BELOW pa07f**, so lr, EMA, repr and
+  head changes can only change how fast it gets there. Improving the score means changing
+  what the loop converges TO, i.e. a signal from outside the loop.
+- Healthy throughout: `target_entropy_ratio` 1.000, `min_dur_frac` 0.110, `peak_ce` 1.402.
+- Practical corollary until then: the best model this objective produces is its warm start
+  plus at most one gentle epoch. Treat further training as a way to test objectives, not to
+  improve checkpoints.
+
+**pb02h** (control + `aug_views: 2, aug_warp_range: 0.05`, `soft_onset_ramp_k` 0, so the
+views only AVERAGE the target onsets), 10 epochs, 2026-09-24. 4 h 20 min, 2.1× the control:
+
+| ep | 0 | 2 | 4 | 6 | 9 |
+|---|---|---|---|---|---|
+| nobonus, aug 2 | 72.87 | 72.31 | 71.92 | 72.20 | 72.25 |
+| nobonus, control | 72.95 | 72.18 | 72.08 | 72.12 | 72.23 |
+| dip, aug 2 | 39.8 | 34.9 | 33.5 | 34.3 | 33.7 |
+
+- **No effect at all:** the same curve and the same fixed point, 72.25 against 72.23.
+  `onset_drift` 0.39, i.e. the loop wanders as much as it does without the views.
+  `onset_sigma_frames` 1.93, so the views DO disagree by about 2 frames, but averaging removes
+  only that symmetric scatter, and the scatter is not what sets the fixed point.
+- Reading: the loop's bias commutes with a ±5% warp. That fits a bias that is a constant
+  FRACTION of a phone (invisible to warping by construction, see `_warped_onsets`). It does
+  not fit a constant-frame bias such as the burst pull, which the warp was aimed at. The one
+  implemented outside-the-loop signal is therefore measured and spent. Leave `aug_views` at 0:
+  it costs 2× and buys nothing.
+
+**pb02i / pb02j** (control with the TRAINING-target onset bonus 3.0 / 0.0), 2026-09-24:
+
+| bonus in targets | e0 | e3 | e6 | e9 | frame_acc | min_dur_frac |
+|---|---|---|---|---|---|---|
+| 10 (pb02f) | 72.95 | 72.25 | 72.12 | 72.23 | 0.579 | 0.109 |
+| 3 (pb02i) | 72.68 | 71.44 | 70.80 | 70.64 | 0.601 | 0.115 |
+| 0 (pb02j) | 72.41 | 69.57 | 68.93 | 68.07 | 0.611 | 0.118 |
+
+- **The bonus IS the anchor, and the fixed point moves monotonically with it.** Lower bonus
+  gives faster, deeper self-agreement drift (frame_acc up, probe down, short phones squeezing).
+  This reproduces pa03a, now WITH the EMA teacher: the teacher does not replace the bonus.
+- **pa07f was trained at bonus 30** (checked in its hyper_parameters). Every pb run warm-starts
+  from it at 10. This is the most likely explanation for "every arm declines from the warm
+  start" (pb02g): pb01 lowered the anchor, which lowered the fixed point, and each run then
+  slides to it. The EMA / repr / lr / warp arms could not change it because none of them touch
+  the anchor.
+- **Separate the two uses of the bonus.** At DECODE it is monotonically harmful per phone
+  (decoder sweep, 30 → 0 gives 68.0 → 74.6, the burst pull). In the TARGETS it is what holds the
+  loop off a self-consistent wrong segmentation. The yaml moved both down together, but only
+  the decode side should move: train with a high bonus, and read/decode with bonus 0 (which is
+  what `nobonus_` already reports).
+- Untested next arm: bonus 30 in the targets (pa07f's own setting) - does the no-bonus
+  readout then hold at 73.4 or rise, rather than slide? Bonus 30 was the setting before the
+  soft_target_mix fix; the pb-era fixes (soft onsets, EMA, correct OneCycle) have never been
+  combined with it.
+
+---
+
+## Where the wall is now — the sharpest statement we have
+
+Transcript-free boundary f1@25, same 200 clips, same scorer:
+
+| signal | pb01a | pb01b |
+|---|---|---|
+| log-mel flux, parameter-free (`bonusflux_`) | 60.34 | 60.34 |
+| the model's embedding, frame-to-frame change (`flux_`) | 53.9 → 51.8 | **60.1 → 62.8** |
+| the model's own posterior confidence dip (`dip_`) | 40.0 → 35.8 | 40.0 → 37.0 |
+| random-init floor | 29.9 | 29.9 |
+
+Before `repr_flux_weight` the trunk was discarding boundary information — the identity
+objective rewards invariance to exactly the acoustic change that marks a boundary. That is now
+fixed, and measurably so. **The information is in the embedding and does not survive the
+classifier.**
+
+Two reasons this is probably not a weighting problem:
+
+- **`dip_abs_err` is 29–30 ms and the receptive field is 38.9 ms.** The dip's precision is
+  pinned near the RF. A `ramp_frames: 2.0` target asks for a ±10 ms transition, sharper than
+  38.9 ms of context can resolve — the target may now be asking for something the architecture
+  cannot produce, whatever the embedding carries.
+- The hat target explicitly asks the classifier for `w = 1.0` across the whole phone interior,
+  i.e. to be **invariant to within-phone change**. That is correct for identity, and it is
+  exactly what suppresses the dip everywhere except a 2-frame window.
+
+**Reasoned next steps (as of 2026-09-23) - ALL THREE TESTED in pb02, none moved the dip; see the pb02 sweep above:**
+
+1. Sweep `ramp_frames` back up (3.0, 4.0) now that `repr_flux` is on — the RF argument says 2.0
+   may be under the resolution floor. Config only.
+2. Sweep `repr_flux_weight` (0.3 / 3.0) to see whether `dip` ever follows `flux`.
+3. Give the classifier an explicit local-change feature — concatenate a short-range embedding
+   difference onto the classifier input — so the head can place a dip without needing the trunk
+   to move. **Implemented as `local_delta`** (`model.CupeCNN.classify`): both one-sided
+   differences `[e_t - e_{t-1}, e_{t+1} - e_t]` through a zero-initialised `delta_proj` added
+   to the classifier's hidden layer (group head untouched). Correction to the note above: it
+   DOES widen context, for the classifier only - one frame each way, 38.9 -> 48.9 ms. The
+   embedding, the repr term and the self-test's 38.9 ms are unchanged. Warm start from pa07f is
+   bit-identical (max |diff| 0.0, checked) via `warm_start_arch_overrides: [local_delta]`;
+   without that line the checkpoint's shape wins and a WARNING prints. +1.05M params, +2 GB
+   peak at batch 108. Read `train_delta_share` (branch norm / embedding-branch norm at the
+   hidden layer): near 0 means the head never used it and the run says nothing.
+
+Standing caveat: pa04a measured that **66% of far misses have a posterior onset spread under
+10 ms — the model is CONFIDENTLY wrong**. If that still holds, nothing that reweights the
+model's own beliefs can move those boundaries.
+
+---
+
+## Ideas discussed, not started
+
+**Boundary spike head (user, 2026-09-23).** A parallel head on the CNN embedding that emits
+isolated 1s: the count equals the number of phones, every 1 has 0s on both sides, and the
+spacing comes from matching the classifier's posterior crossings within a leeway radius. The
+motivation: the older CUPE snapped boundaries to sudden embedding change (layer and frame radius
+as knobs), and that worked better on CNN embeddings than on MLP logits. This repo's numbers agree:
+embedding flux f1@25 is 62.8 against a posterior dip of 37.
+
+Discussion points, before anyone builds it:
+- Without identity, "N isolated spikes" is CTC with one repeated label, so it has the same
+  unconstrained timing: any N positions score equally well. The drift toward the start of the
+  sentence follows from that. As a soft loss (sigmoid, expected count = N) it also has a
+  smeared minimum at p = N/T that barely pays the isolation penalty.
+- The spacing term is what carries the information. Matched to the classifier's crossings, it
+  distils the aligner and cannot beat it. This is the rejected `BoundaryHead` again: supervised
+  by Viterbi onsets it scored 54.4 against raw flux at 59.5.
+- The forced aligner already enforces count = N, monotonic spacing and a minimum duration, and
+  it also knows the phone identities. The only new thing the head adds is where it reads from:
+  the local CNN layer. `local_delta` (pb02a) tests that part at a fraction of the cost.
+- **Cheapest test, no training:** snap the Viterbi onsets to embedding-flux peaks within radius
+  r (sweep the tap × r ∈ {1, 2, 3}) and score no-bonus f1@25 and per-phone. If snapping does
+  not help, a head trained toward the same signal will not help either. Caveat: the mel-flux
+  onset bonus is monotonically worse per phone, because it drags onsets onto stop bursts.
+- **TESTED 2026-09-24 (`snap_sweep.py`), result: no effect.** 108 configs per checkpoint: taps
+  fe/ctx/emb/hid/post/mel × span 1,2 × radius 1–3 × peak-z gate −∞/0/1, on pa07f e0, pb02f
+  final and pb02c final. The no-bonus aligner does the placing; snapping only moves each onset.
+  The config is picked on the tune half and read on the holdout half:
+
+  | ckpt | baseline hold f1 / phone | tune pick | pick's hold f1 / phone |
+  |---|---|---|---|
+  | pa07f e0 | 73.41 / 72.79 | fe k1 r2 z1 | 73.27 / 72.66 |
+  | pb02c e10 | 72.43 / 72.13 | fe k1 r2 z1 | 72.39 / 72.00 |
+
+  (with `--offset 0.5`, see below.) The tune gain (+0.1 to +0.5 per phone) does not transfer,
+  and every holdout difference is within ±0.3, i.e. noise. **The change signal in no layer
+  carries boundary timing that the forced aligner lacks.** The layer ORDER does reproduce the
+  old CUPE finding: the earliest CNN tap `fe` is consistently the best snap target, and
+  emb/hid/post/mel are all tied and worse. That only means fe does the least harm. Per class,
+  fe snapping helps vowels (+0.4–0.9) and hurts nasals (−1.3 to −1.6).
+- Side finding, conventions: reporting onsets at `o − 0.5` frames (where the hat puts the 0.5
+  crossing) scores ~0.4 f1 and 0.6–1.0 per-phone BELOW reporting them at `o`, on every
+  checkpoint. The aligner's onsets land about half a frame early against TIMIT's labels (or
+  its convention), so the probe's `o * ms` readout is the better-calibrated one. Any readout on
+  the `i − 0.5` convention (dip_, flux_, sub_) carries that 2.5 ms handicap.
+- Verdict on the spike head: its spacing term would have to supply timing that no layer
+  carries, so do not build it. Re-propose only if some new signal passes this snap test first.
+
+---
+
+## The objective — what was chosen and why
 
 - **Hat-shaped target, no blank.** Each phone's posterior peaks at 1.0 across its interior and
   falls linearly to **exactly 0.5 at each boundary**, where the neighbour rises through 0.5. The
-  boundary is therefore the **crossing point of two posteriors** — continuous, recoverable by
+  boundary is the **crossing point of two posteriors** — continuous, recoverable by
   interpolation (`refine_onsets`), which is why 5 ms frames are not the resolution limit.
 - **Why not CTC.** CTC marks a phone with a spike and fills the gaps with blank; *where inside a
-  blank run the boundary lies is not represented in the output at all*. p2cupe measured placement
-  inside a blank run at chance (26.8 ms observed vs 25.9 ms predicted by random placement in a
-  4.85-frame run). Snapping onto spectral flux, a learned boundary head and a partition CE were
-  all attempts to recover information the loss had already discarded, and all three measured out
-  at ~zero or negative. Here there is nothing to recover.
+  blank run the boundary lies is not represented in the output at all*. p2cupe measured
+  placement inside a blank run at chance (26.8 ms observed against 25.9 ms predicted by random
+  placement in a 4.85-frame run). Snapping onto spectral flux, a learned boundary head and a
+  partition CE were all attempts to recover information the loss had already discarded, and all
+  three measured out at ~zero or negative.
 - **Targets come from the model itself**: monotonic Viterbi against the known phoneme sequence,
-  under `no_grad`, every step — classic hard-EM, the bootstrap HTK/MFA use. Minimum phone
-  duration is enforced by expanding each phone into `min_phone_frames` sub-states.
+  under `no_grad` — classic hard-EM, the bootstrap HTK/MFA use. Minimum phone duration is
+  enforced by expanding each phone into `min_phone_frames` sub-states.
 - **Flat start = the diagonal band prior**, weight 1 → 0 over `align_prior_epochs`. At weight 1
-  the alignment is "divide the clip evenly between the phones". **This is the only schedule in
-  the objective** — deliberately, after p2cupe drowned in ramps. Set to 0 when warm starting.
-- **Optional SIL at both ends** (MFA's optional silence). Without a blank nothing absorbs leading
-  silence, and TIMIT clips open with ~130 ms of it, so the first phone would otherwise be dragged
-  to frame 0 on every clip.
-- **The soft target has entropy**, so the CE cannot reach 0. `train_peak_kl` (CE minus target
-  entropy) is the number that goes to zero; the raw loss plateaus around 0.2–0.4 by construction.
-  This also prevents the saturation that made p2cupe's posteriors useless for placement.
-- **The group head is the same loss at coarser granularity**, at a fixed `group_loss_weight`. It
-  is *not* a second objective: no schedule, no ramp, no dynamic priority controller.
+  the alignment is "divide the clip evenly between the phones". Set to 0 when warm starting.
+- **Optional SIL at both ends** (MFA's optional silence). Without a blank nothing absorbs
+  leading silence, and TIMIT clips open with ~130 ms of it.
+- **The target has entropy**, so the CE cannot reach 0. `peak_kl` (CE minus target entropy) is
+  the number that goes to zero. **This is the property `soft_target_mix: 1.0` destroyed.**
+- **The group head is the same loss at coarser granularity**, at a fixed `group_loss_weight`.
+  Not a second objective: no schedule, no ramp, no priority controller.
 
-**Knobs, in the order worth turning:** `ramp_frames` (3.0 — the identity/placement trade-off; if
-`sub_f1` does not beat frame-grid `f1`, this is the knob, **not** the architecture) →
-`align_prior_epochs` → `context_kernels` → `min_phone_frames` → `group_loss_weight`.
-
----
+**A known bias in the hat, currently masked.** `ramp` is clipped to half the segment, so a
+phone's total `sum log w` saturates at −0.914 for `L >= 2*ramp` but is *cheaper* below it
+(−0.604 at L=4, −0.288 at L=2). A perfectly fitted model therefore scores a **higher** Viterbi
+path by squeezing phones onto the duration floor — the `min_dur_frac` climb seen whenever the
+duration prior is relaxed. `soft_frame_cost` currently over-corrects it (a 3-frame phone with
+`soft_phone_frames: 10` pays 10 nats against the hat's ~0.6), so it is not the active problem,
+but widening ramps enlarges the biased region. Watch `min_dur_frac`.
 
 ## The model — what was chosen and why
 
-- **CNN only, no transformer.** p2cupe's own per-layer probe scored boundary placement at every
-  tap, and the ordering was stable across checkpoints: layers that *cannot* mix across time
-  scored ~20 f1 points above layers that can (`spectral_stream` 1x1 > `fusion` >
-  `temporal_stream` at 150 ms RF > transformer output). A module that smears 150 ms into one
-  frame cannot say where a 10 ms event starts, and no loss downstream of it can undo that.
-- **5 ms frames** (conv strides 4·4·5 = 80 samples), replacing 13.125 ms. 13 ms put a ~6.5 ms
-  quantisation floor under every boundary before the model did anything.
-- **38.9 ms receptive field**, set by two stride-1 context convs (`context_kernels: [5, 3]`), each
-  kernel adding (k−1)·5 ms. Near the 44.7 ms tap that scored best in p2cupe. Widening this walks
-  back toward the 150 ms time-mixer that destroyed p2cupe's boundaries — do not, without reading
-  `val_timit_dip_f1_25ms`.
+- **CNN only, no transformer.** p2cupe's per-layer probe scored boundary placement at every tap
+  and the ordering was stable: layers that *cannot* mix across time scored ~20 f1 points above
+  layers that can. A module that smears 150 ms into one frame cannot say where a 10 ms event
+  starts, and no loss downstream of it can undo that.
+- **5 ms frames** (conv strides 4·4·5 = 80 samples). 13 ms put a ~6.5 ms quantisation floor
+  under every boundary before the model did anything.
+- **38.9 ms receptive field**, from two stride-1 context convs (`context_kernels: [5, 3]`).
+  Widening walks back toward the time-mixer that destroyed p2cupe's boundaries.
 - **Every conv has an odd kernel with `padding = kernel // 2`**, which is what puts frame `f` on
   input sample `f * 80` with no offset term anywhere. An even kernel shifts every timestamp by
   half a frame and nothing raises — `model.py`'s self-test asserts this with a click at a known
   sample. **Keep that test.**
-- **Windowing kept** (120 ms window / 80 ms stride) because removing context is what makes the
-  model multilingual — 120 ms is too short to memorise any language's phonotactics. The stride
+- **Windowing kept** (120 ms / 80 ms stride): removing context is what makes the model
+  multilingual, and 120 ms is too short to memorise any language's phonotactics. The stride
   advances exactly 16 of 24 frames, so the stitched grid *is* the conv grid and
   `time_ms = frame * 5.0` is exact.
-- **5.14M params**, down from ~30M. Output dims stay 67/17; index 66/16 ('noise') exists in the
-  shared mapper and downstream tooling indexes by it, but is **never a target** here.
 
 ---
 
-## Deleted from p2cupe, with the reason (do not reintroduce without new evidence)
+## Do not reintroduce — measured and rejected
 
-| removed | why |
+| idea | what happened |
 |---|---|
+| `soft_target_mix: 1.0` (occupancy as the class distribution) | deletes the hat; the entropy runaway above. Use `soft_onset_mix`. |
+| `soft_onset_ramp_k > 0` (widen ramp by onset sigma) | pb01a: dip 40.0 → 35.8, sub f1@10 57.5 → 55.9. Buys nothing. |
+| soft-EM in general | pa04a: per phone 74.1 holdout against a 75.4 start. The misses are CONFIDENT — 66% of far misses have spread < 10 ms. |
 | transformer | the worst layer in its own boundary probe |
 | CTC + blank + blank/SIL penalties | the boundary is not representable in its output |
-| `BoundaryHead` + BCE | supervised by Viterbi onsets, i.e. distilled from a *worse* teacher than raw flux (54.4 vs 59.5 on the same checkpoint) |
+| `BoundaryHead` + BCE | supervised by Viterbi onsets, i.e. distilled from a *worse* teacher than raw flux (54.4 against 59.5) |
 | flux hinge (`bnd_lambda`) | inert at low weight, destructive at high (66.2 → 40.4 f1@25 in two epochs) |
 | partition CE + lambda ramp | mechanism worked perfectly (`direct_transition_frac` 0 → 0.98) and moved the metric not at all, three rounds running |
+| local attention for identity (pa02a) | +1 point frame acc, lower CE, boundaries unmoved; every class row within ±1.5. 35% slower. |
+| wider windows / wider per-frame context (pa06) | 360 ms + attention was not better than 120 ms; re-windowing alone cost ~2 points |
+| removing the onset bonus from the TARGETS (pa03a) | declined every epoch; the bonus was the only non-self-referential anchor |
+| stronger duration prior (pa03b/c) | stops the squeeze, boundaries still below the start. The squeeze was a symptom, not the cause. |
+| per-class / obstruent-only bonus scaling | effects are not additive per class; remove the pull on a vowel and the same flux peak drags the neighbouring consonant onto it |
+| sub-phone (multi-state) phones, MFA-style (pa05) | gave the first per-phone gain over pa01d (76.2 against 75.4) but drifted again when trained at the better topology, and nasals fell 84 → 76. **Rolled back by the user; `states.py` deleted.** Re-propose only with new evidence. |
 | CTC anneal, dual-loss priority controller, curriculum imbalance | schedules tuning schedules |
-| confusion matrices, confidence accumulator, contextual refiner | diagnostics for a model that no longer exists |
+
+**The onset bonus itself.** The decoder sweep is unambiguous that per phone it is monotonically
+worse (30 → 10 → 3 → 1 → 0 gives 68.0 → 70.1 → 71.6 → 73.4 → 74.6) because it drags onsets onto
+stop bursts. The `levenshtein` headline moves the opposite way only because it credits TIMIT's
+extra closure→burst boundaries — it rewards the bonus for the wrong reason. It is now at 10,
+down from 30, with the EMA teacher as the anchor instead.
 
 ---
 
-## Evaluation strategy
+## Evaluation
 
 - **`metrics.py` is a verbatim copy of p2cupe's and must stay that way** — it is the unchanged
-  yardstick. Only how much is fed to it may change (`per_max_segments`, `per_every_n_epochs`).
-- **PER/GER are guards, not targets.** In p2cupe they were *anti*-correlated with placement (the
-  best alignment ever recorded came from a GER 0.22 model, not the GER 0.098 one), so
-  `ckpt_monitor` is a boundary f1 and `early_stop_metric` is `val_loss`. Expect PER **well above
-  1** early: with no blank, every argmax flicker is an insertion.
-- **The TIMIT probe is the real instrument**, rewritten for this lineage with four readouts:
-  `(none)` frame-grid, **`sub_`** (interpolated crossing — the headline), **`dip_`** (free
-  peak-pick on the confidence dip, *no transcript* — the falsification test for whether the V
-  shape formed at all), `flux_` (p2cupe's best signal, the bar to clear).
-- **Measured floors at random init** (400 clips, this architecture): decoder 22.5, sub 22.7, dip
-  29.9, flux 37.1 f1@25. Everything proposes roughly as many boundaries as exist on clips with one
-  every ~80 ms, so guessing scores well. **Read the gaps, not the absolutes.**
+  yardstick. Only how much is fed to it may change.
+- **PER/GER are guards, not targets.** In p2cupe they were *anti*-correlated with placement, so
+  `ckpt_monitor` is a boundary f1. Currently `per_enabled: false` and `frame_acc` is the
+  identity guard — remember it measures agreement with the model's OWN alignment, not accuracy.
+- **The TIMIT probe is the real instrument** (validation only, never trained on), with readouts
+  `(none)` frame-grid, `sub_` (interpolated crossing), `dip_` (free peak-pick on the confidence
+  dip, **no transcript** — the falsification test), `flux_` (embedding change), `bonusflux_`
+  (the fixed log-mel flux the bonus reads), and `nobonus_` (same aligner, bonus zeroed — the
+  monitor). Odd clips are the holdout (`val_timit_*`), even are the tuning half (`tune_*`).
+- **Measured floors at random init** (400 clips): decoder 22.5, sub 22.7, dip 29.9, flux 37.1
+  f1@25. A plain uniform split scores 52.4. **Read the gaps, not the absolutes.**
+- **Reference points.** MFA on the same 400 clips: 79.1 f1@25 on the standard scorer, 83.7
+  per-phone hit@25. pa01d e3 was 75.8 headline / 75.4 per-phone decoded with bonus 0.
+- **The per-phone score is the honest one.** `miss_breakdown.py` matches phone sequences instead
+  of boundaries, so TIMIT's extra closure→burst boundaries cannot inflate it. Run
+  `decoder_sweep.py` / `miss_breakdown.py` / `error_breakdown.py` on the best checkpoint, with
+  bonus 0, before believing any headline.
+- **Where the remaining gap to MFA lives**: gradual transitions. Vowel onsets 67 against 86,
+  lateral 57/77, rhotic→vowel 54/81, glide→vowel 51/78. Stops are a *convention* difference,
+  not an error — p3 starts a stop at its BURST, MFA and TIMIT at its CLOSURE.
+- **f1@10 against MFA, before using it as a selling point**: p3 leads 58.9 to 53.6 on the
+  standard scorer, but scored on phone onsets only MFA leads at every tolerance (57.7 to 52.1).
+  The claim holds on the benchmark; it rests on the burst convention.
 
 ---
 
@@ -596,15 +517,37 @@ from which a boundary must afterwards be recovered.
 - **Sequences are padded with `-100`** by `SegmentsCollator`. The DP gathers emissions for every
   column, so a negative id is an out-of-bounds index → a CUDA device-side assert several kernels
   later, pointing somewhere else. Clamped once in `prepare_targets`.
-- **The padding shortcut must include the window that overlaps the tail** (`(max_frames-1) //
-  stride_frames + 1`, not "enough windows to reach it"). One short changes the value of the last
-  ~8 frames of every clip, silently. `smoke_test.py` asserts the shortcut is numerically identical
-  to computing everything.
-- **p2cupe's TIMIT probe fed audio at 1/10 the training level** (`wav / rms * 0.1` against the
-  collator's `wav / rms`). BatchNorm hides most of it. p3's probe matches the collator exactly.
-- **Stitching accumulates in float32** even under bf16 autocast: the boundary readout interpolates
-  the *difference* between adjacent frames' logits, and bf16's ~0.06 resolution at logit 10 lands
-  directly on that quantity.
+- **The padding shortcut must include the window that overlaps the tail**
+  (`(max_frames-1) // stride_frames + 1`, not "enough windows to reach it"). One short changes
+  the value of the last ~8 frames of every clip, silently. `smoke_test.py` asserts this.
+- **p2cupe's TIMIT probe fed audio at 1/10 the training level.** BatchNorm hides most of it.
+  p3's probe matches the collator exactly.
+- **Stitching accumulates in float32** even under bf16 autocast: the boundary readout
+  interpolates the *difference* between adjacent frames' logits, and bf16's ~0.06 resolution at
+  logit 10 lands directly on that quantity. The same applies to the EMA teacher's forward.
+- **`occupancy_to_onsets` needs float64** — float32 returns a negative variance, i.e. NaN sigma.
+- **`searchsorted` does not check sortedness**, it returns nonsense. Any blended onset tensor
+  must be `cummax`-ed first.
+- **The EMA teacher must not be a module attribute** — `nn.Module.__setattr__` registers it and
+  every older checkpoint stops loading.
+- **`dev_run: true` writes `m_<exp>_final_e1.pt` under the same experiment name**, so never
+  warm-start from that file by accident and never wait on it to detect the end of a real run.
+  Wait for the process to exit.
+- **`last.ckpt` is the last MONITORED checkpoint**, not the final epoch; the final weights are
+  `m_<exp>_final_e<N>.pt`.
+
+### Fixed 2026-09-23: the OneCycle schedule never annealed
+
+`configure_optimizers` passed `len(train_dataloader())` — *batches* — as `steps_per_epoch`, but
+Lightning steps an `interval: 'step'` scheduler once per **optimiser** step. With
+`accumulate_grad_batches: 2` the cycle was twice as long as the run: pb01a configured 1760 steps
+and took 880, so the lr peaked at epoch 6 and ended at ~4e-5, never annealing. **Every run
+before pb01b has this bug** — read their late-epoch numbers with it in mind; pb01a's metric dip
+at e6–e8 and its recovery at e9 track the lr peak, not the loss.
+
+Related and still true: `epochs` is a learning-rate knob. OneCycle spreads warmup over
+`pct_start=0.3` of the whole run, so at `epochs: 100` the first ~10 epochs run at a tenth of
+`lr` and look dead. p2cupe lost 10 GPU-hours to this.
 
 ---
 
@@ -612,65 +555,52 @@ from which a boundary must afterwards be recovered.
 
 The targets come from the model's own alignment, so **the loss can be driven to zero by a
 segmentation that is perfectly self-consistent and systematically wrong** — every boundary 20 ms
-early, say. Nothing inside the objective can detect that; it is the known failure mode of hard-EM
-and the price of having no boundary labels. The three guards are all external: the diagonal prior
-while the model is random, the TIMIT probe every epoch (labels training never sees), and
-`train_mean_phone_frames` against the corpus's real phone rate.
+early, say. Nothing inside the objective can detect that; it is the known failure mode of
+hard-EM and the price of having no boundary labels. The guards are all external: the diagonal
+prior while the model is random, the TIMIT probe every epoch (labels training never sees),
+`train_mean_phone_frames` against the corpus's real phone rate, and now `target_entropy_ratio`
+and `onset_drift`.
 
 **Watch the probe, not the loss.**
 
-## pa07a result (MLS_7l_100h, 4 epochs, user ran it overnight 2026-09-19/20)
+---
 
-English TIMIT holdout, per epoch: sub f1@25 74.45 / 73.13 / 72.02 / 71.05; nobonus 71.44 /
-67.94 / 66.41 / 65.19; sub f1@10 57.88 / 56.69 / 55.65 / 54.88. Monotonic decline, and much
-steeper than any English continuation (those lost 1-2 points).
+## Engineering notes
 
-Per phone (holdout, bonus 0, min 6 / soft 4): pa01d e3 75.4 -> pa07a e1 71.4 -> pa07a e4 63.8.
-Every class falls: vowel 78.8 -> 71.5 -> 63.5, rhotic 60.9 -> 49.0 -> 41.9, stop 76.8 -> 75.1
--> 68.2, fricative 81.1 -> 82.2 -> 72.1. val_frame_acc 0.367 (on MLS, against its own
-alignments); val_min_dur_frac 0.119, so no squeeze; epoch_mins 160.
-
-NOT DIAGNOSABLE with what is here: every labelled boundary set available is English (TIMIT,
-Buckeye). MLS and the UCLA Phonetic Corpus have no timestamps, so "good for multilingual"
-cannot be measured locally - only English degradation can, and it is large. Either the model
-lost English while gaining other languages, or it degraded outright; the two look identical
-from here. Deciding this needs a non-English labelled set or an external eval.
-
-## Engineering notes moved out of the README (2026-09-20)
-
-Kept here so the README stays about the model. All still true.
-
-### Why two DDP ranks report different GPU memory
-
-Not different work: plain Lightning ddp, every log sync_dist=True. The peak is set by the
+**Why two DDP ranks report different GPU memory.** Not different work. The peak is set by the
 longest clip in a batch when `fixed_window_batch: false`, and the caching allocator never
-returns memory, so each rank strands a different amount. MEASURED, 30 steps, 1-10 s clips:
+returns memory, so each rank strands a different amount. Measured over 30 steps, 1–10 s clips:
+ragged shapes 4.03–4.46 GB (0.43 swing), ragged + `expandable_segments` 3.10–3.14 (0.04), fixed
+shapes 3.95 (0.00), fixed + expandable 3.23 (0.00). **A flat footprint comes from fixing the
+SHAPES, not from the allocator.** Measure the per-clip constant under the precision you train
+at: the same benchmark in fp32 reads 2.2x high.
 
-| | reserved | swing |
-|---|---|---|
-| ragged shapes, stock allocator | 4.03-4.46 GB | 0.43 GB |
-| ragged shapes, expandable_segments | 3.10-3.14 GB | 0.04 GB |
-| fixed shapes, stock allocator | 3.95 GB | 0.00 GB |
-| fixed shapes, expandable_segments | 3.23 GB | 0.00 GB |
+**Why validation got slow.** `MetricsCalculator5.calculate_per`'s edit distance is an
+O(decoded × target) Python double loop over torch scalars, and with no blank to collapse runs
+the decoded length starts near the FRAME count. Measured at 1992 frames/clip: 6.7 s/clip
+untrained, 0.68 s at 50 ms phone runs, 0.14 s at 250 ms runs. Capped by `per_max_segments` and
+`per_every_n_epochs`; `per_enabled: false` is the current default.
 
-So a flat footprint comes from fixing the SHAPES, not from the allocator. Measure the per-clip
-constant under the precision you train at: the same benchmark in fp32 reads 2.2x high.
-`expandable_segments` is 18% leaner but maps pages on demand, so on a full card it warns and
-falls back instead of raising. Not a limit though it looks like one: the windowed forward
-flattens to [B*W, ...] and passes 2^31 elements around batch 187 at 10 s; a conv producing
-2.21e9 elements was tested and runs fine.
+**The `AccumulateGrad node's stream does not match` warning** is unrelated and harmless: it
+fires on a single GPU too, and the two things that could hold a graph across steps were checked.
 
-### Why validation got slow, and what caps it
+**Corpus choice matters for diagnosis.** MLS_7l_100h and mswc38_50h both degrade the English
+TIMIT probe for reasons that are not the loss — mswc38 is isolated words
+(`mean_phone_frames` 26.9 against libri's 15.9, so most frames are silence and the hat's entropy
+is intrinsically lower). Multilingual quality is **not diagnosable locally**: every labelled
+boundary set available is English, so "lost English while gaining other languages" and "degraded
+outright" look identical from here. Diagnose the loss on libri_100h.
 
-`MetricsCalculator5.calculate_per`'s edit distance is an O(decoded x target) Python double loop
-over torch scalars. With no blank to collapse runs, the decoded length starts near the FRAME
-count. MEASURED at 1992 frames/clip: 6.7 s/clip untrained, 0.68 s at 50 ms phone runs, 0.14 s
-at 250 ms runs. So it shrinks as the model sharpens, but the early epochs are the expensive
-ones. Capped by `per_max_segments` (per rank) and `per_every_n_epochs`; `per_enabled: false`
-switches it off entirely, which is the current default. metrics.py is never touched.
+---
 
-### The `AccumulateGrad node's stream does not match` warning
+## Checkpoint inventory (2026-09-24)
 
-Unrelated and harmless: it fires on a single GPU too, and the two things that could hold a
-graph across steps were checked (Lightning recursive_detaches logged tensors; nothing keeps
-`loss` or the alignment dict alive past the step).
+`tmp/training/p3cupe/`: pa05a, pa07e, pa07f, pa08a, pa08b, pa09a, pa09b, pb01a, pb02a–pb02j,
+plus `logs/` (every pb02 arm's stdout, `snap_sweep*.txt`, the queue logs).
+
+- **pa07f e0 is the best checkpoint and the warm start for the final recipe.**
+- `pb01a/` holds BOTH pb01a and pb01b: pb01b's files have 10:xx timestamps.
+- pb02a–j: each has an e0/e1 top-2 `.ckpt` and a `final_e10.pt`. None beats pa07f. Keep them only
+  as reference points for an A/B; they are safe to delete.
+- pa09a / pa09b are the collapsed `soft_target_mix: 1.0` runs; keep only as a "before" arm.
+- pa01d e3 was deleted in an earlier cleanup.

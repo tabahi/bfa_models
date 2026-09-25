@@ -141,19 +141,23 @@ class CupeCNN(nn.Module):
             every block, and 2 * radius * 5 ms of receptive field PER BLOCK. Read
             `val_timit_dip_f1_25ms` before turning it on - it is the same trade the
             context_kernels note describes.
+        local_delta: 0 = off. 1 feeds the phone classifier the embedding's own change to each
+            neighbour, `[e_t - e_{t-1}, e_{t+1} - e_t]`, through a ZERO-INITIALISED projection
+            added to the classifier's hidden layer. See `classify`.
     '''
 
     def __init__(self, input_wav_length=None, cnn_channels=192, embed_dim=512,
                  context_kernels=(5, 3), cnn_dropout=0.1, head_dropout=0.1,
                  noise_level=0.01, phoneme_classes=66, phoneme_groups=16,
-                 frame_blocks=4, ffn_mult=4, attn_radius=0, attn_heads=8, block_dropout=0.1):
+                 frame_blocks=4, ffn_mult=4, attn_radius=0, attn_heads=8, block_dropout=0.1,
+                 local_delta=0):
         super().__init__()
         self.config = None
         if input_wav_length is not None:
             self.config_model(input_wav_length, cnn_channels, embed_dim, context_kernels,
                               cnn_dropout, head_dropout, noise_level,
                               phoneme_classes, phoneme_groups, frame_blocks, ffn_mult,
-                              attn_radius, attn_heads, block_dropout)
+                              attn_radius, attn_heads, block_dropout, local_delta)
             self.make_model()
 
     # ------------------------------------------------------------------ config
@@ -161,7 +165,7 @@ class CupeCNN(nn.Module):
     def config_model(self, input_wav_length, cnn_channels, embed_dim, context_kernels,
                      cnn_dropout, head_dropout, noise_level, phoneme_classes, phoneme_groups,
                      frame_blocks=0, ffn_mult=4, attn_radius=0, attn_heads=8,
-                     block_dropout=0.1):
+                     block_dropout=0.1, local_delta=0):
         self.config = {
             'input_wav_length': int(input_wav_length),
             'cnn_channels': int(cnn_channels),
@@ -177,6 +181,7 @@ class CupeCNN(nn.Module):
             'attn_radius': int(attn_radius),
             'attn_heads': int(attn_heads),
             'block_dropout': float(block_dropout),
+            'local_delta': int(local_delta),
         }
 
     def load_config_state_dict(self, config_dict):
@@ -243,8 +248,24 @@ class CupeCNN(nn.Module):
             nn.Linear(d // 2, self.groups_dim),
         )
 
+        # Local-change branch into the phone classifier. Zero-initialised, so a model built
+        # with it computes exactly what the checkpoint it was grown from computed, and the
+        # warm start is an A/B against the same starting point. `.get` so older configs
+        # rebuild without it.
+        self.local_delta = int(cfg.get('local_delta', 0))
+        self.delta_proj = None
+        if self.local_delta:
+            self.delta_proj = nn.Linear(2 * d, d * 2)
+            nn.init.zeros_(self.delta_proj.weight)
+            nn.init.zeros_(self.delta_proj.bias)
+
         self.frame_stride_samples = self._frame_stride()
         self.receptive_field_samples = self._receptive_field()
+        # The delta reads one neighbour either side, so the phone POSTERIOR sees one frame
+        # more each way than the embedding does. Reported separately: the trunk's number is
+        # the one the self-test pins and the one the context experiments were about.
+        self.head_receptive_field_samples = (self.receptive_field_samples
+                                             + 2 * self.frame_stride_samples * bool(self.local_delta))
         self.frames_per_window = self.update_frames_per_window(self.input_wav_length)
 
     def _strided_convs(self):
@@ -293,7 +314,9 @@ class CupeCNN(nn.Module):
                 f"frame stride {self.frame_stride_samples} samples "
                 f"({self.frame_stride_samples * ms:.3f} ms), "
                 f"receptive field {self.receptive_field_samples} samples "
-                f"({self.receptive_field_samples * ms:.1f} ms), "
+                f"({self.receptive_field_samples * ms:.1f} ms)"
+                + (f" + local delta -> classifier {self.head_receptive_field_samples * ms:.1f} ms"
+                   if self.local_delta else "") + ", "
                 f"{sum(p.numel() for p in self.parameters()) / 1e6:.2f}M params")
 
     # ------------------------------------------------------------------ forward
@@ -320,7 +343,37 @@ class CupeCNN(nn.Module):
         return (emb, tap.transpose(1, 2)) if return_tap else emb
 
     def classify(self, embeddings):
-        return self.classifier(embeddings), self.group_classifier(embeddings)
+        '''
+        embeddings: [N, T, embed_dim] -> (class logits, group logits)
+
+        ## local_delta
+
+        `repr_flux_weight` put boundary information into the embedding (flux f1@25 above
+        log-mel for the first time) and none of it reached the posteriors' confidence dip. The
+        hat asks the classifier to be flat across a phone interior, i.e. invariant to
+        within-phone change, and a per-frame MLP can only see change the trunk has already
+        folded into the frame itself. This hands the head the change directly, so it can
+        place a dip without the trunk having to move.
+
+        Both one-sided differences, not the centred one: the centred difference cancels at
+        the frame where the change happens, and the sign says which neighbour is changing.
+        Computed inside the window with a zero at each edge - those frames get ~1e-3 of the
+        stitch weight, so the overlapping window supplies them. The group head is left alone.
+        '''
+        if self.delta_proj is None:
+            return self.classifier(embeddings), self.group_classifier(embeddings)
+        e = embeddings
+        step = e[:, 1:] - e[:, :-1]
+        zero = torch.zeros_like(e[:, :1])
+        delta = torch.cat([torch.cat([zero, step], 1), torch.cat([step, zero], 1)], -1)
+        base = self.classifier[0](e)
+        extra = self.delta_proj(delta)
+        if self.training:
+            # Diagnostic only: how much of the hidden pre-activation the branch carries. A
+            # plain tensor attribute, so it never enters the state_dict.
+            self.delta_share = (extra.detach().float().norm()
+                                / base.detach().float().norm().clamp(min=1e-6))
+        return self.classifier[1:](base + extra), self.group_classifier(e)
 
     def forward(self, x):
         return self.classify(self.encode(x))
@@ -349,7 +402,7 @@ class CupeExtractor(nn.Module):
 
         state = {k.replace('model.', '', 1): v for k, v in checkpoint['state_dict'].items()}
         keep = ('feature_extractor.', 'freq_attention.', 'context.', 'blocks.', 'norm.',
-                'classifier.', 'group_classifier.')
+                'classifier.', 'group_classifier.', 'delta_proj.')
         state = {k: v for k, v in state.items() if k.startswith(keep)}
         missing, unexpected = model.load_state_dict(state, strict=False)
         if missing:
@@ -438,10 +491,31 @@ if __name__ == "__main__":
     # A checkpoint config from before the blocks existed rebuilds as the same 5.1M network.
     legacy = {k: v for k, v in model.config.items()
               if k not in ('frame_blocks', 'ffn_mult', 'attn_radius', 'attn_heads',
-                           'block_dropout')}
+                           'block_dropout', 'local_delta')}
     old = CupeCNN()
     old.load_config_state_dict(legacy)
     old.make_model()
     assert len(old.blocks) == 0 and old.receptive_field_samples == 623
+    assert old.delta_proj is None
     print("legacy config:", old.describe())
+
+    # local_delta: grown from a plain model's weights it must compute EXACTLY the same logits
+    # (zero-initialised branch), and once trained its reach is one frame further each way.
+    grown = CupeCNN(input_wav_length=1920, local_delta=1).eval()
+    missing, unexpected = grown.load_state_dict(model.state_dict(), strict=False)
+    assert sorted(missing) == ['delta_proj.bias', 'delta_proj.weight'] and not unexpected, missing
+    assert grown.receptive_field_samples == 623 and grown.head_receptive_field_samples == 783
+    with torch.no_grad():
+        a, b = model(x.clone()), grown(x.clone())
+    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1]), "grown head must start identical"
+    torch.nn.init.normal_(grown.delta_proj.weight, std=0.05)
+    with torch.no_grad():
+        g0 = grown.classify(grown.encode(base))[0]
+        g1 = grown.classify(grown.encode(spike))[0]
+        m0 = model.classify(model.encode(base))[0]
+        m1 = model.classify(model.encode(spike))[0]
+    reach_g = int(((g1 - g0).abs().mean(-1)[0] > 1e-3 * float((g1 - g0).abs().max())).sum())
+    reach_m = int(((m1 - m0).abs().mean(-1)[0] > 1e-3 * float((m1 - m0).abs().max())).sum())
+    assert reach_g == reach_m + 2, (reach_g, reach_m)
+    print(grown.describe())
     print("model.py self-test OK")

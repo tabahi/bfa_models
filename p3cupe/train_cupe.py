@@ -1,16 +1,30 @@
 '''
 Entry point.
 
-    /root/anaconda3/bin/python p3cupe/train_cupe.py p3cupe/cupe_hp
+    /root/anaconda3/bin/python p3cupe/train_cupe.py p3cupe/cupe_hp [key=value ...]
 
 Takes a YAML path without the extension. The config file describes the run and is logged to
-Weights and Biases.
+Weights and Biases. Trailing `key=value` pairs override single yaml keys for a sweep arm, e.g.
+`experiment=pb02b ramp_frames=3.0`; each value is parsed as YAML, so `[local_delta]` is a list.
+The resolved config is what W&B records.
 '''
 
 import os
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+def parse_overrides(args):
+    '''`key=value` pairs from the command line, each value parsed as YAML.'''
+    import yaml
+    out = {}
+    for a in args:
+        key, sep, value = a.partition('=')
+        if not sep or not key:
+            raise ValueError(f"expected key=value, got {a!r}")
+        out[key.strip()] = yaml.safe_load(value)
+    return out
+
 
 def _apply_alloc_conf(argv):
     '''
@@ -40,6 +54,7 @@ def _apply_alloc_conf(argv):
             conf = (yaml.safe_load(f) or {}).get('cuda_alloc_conf', '')
     except OSError:
         return
+    conf = parse_overrides(argv[2:]).get('cuda_alloc_conf', conf)
     if conf:
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = str(conf)
         print(f"PYTORCH_CUDA_ALLOC_CONF={conf}")
@@ -67,6 +82,10 @@ def run_training(hp):
     paths_list, total_hours, val_data = splits.get_splits(hp.data_src, dev_mode=False)
     val_paths_list = val_data[0] if val_data else None
     print(paths_list[0])
+    if hp.limit_data:
+        paths_list = paths_list[:hp.limit_data]
+        if val_paths_list:
+            val_paths_list = val_paths_list[:int(hp.limit_data*0.25)]
 
     torch.manual_seed(hp.seed)
     torch.set_float32_matmul_precision('medium')
@@ -173,6 +192,14 @@ if __name__ == "__main__":
     if not os.path.exists(hp_file):
         raise FileNotFoundError(f"Hyper parameters config file not found: {hp_file}")
     with open(hp_file) as f:
-        hp = Namespace(**yaml.safe_load(f))
+        conf = yaml.safe_load(f)
+    overrides = parse_overrides(sys.argv[2:])
+    unknown = sorted(set(overrides) - set(conf))
+    if unknown:
+        # A typo here would otherwise run the yaml's value under the arm's name.
+        raise KeyError(f"override keys not in {hp_file}: {unknown}")
+    for k, v in overrides.items():
+        print(f"override: {k}: {conf.get(k)!r} -> {v!r}")
+    hp = Namespace(**{**conf, **overrides})
 
     run_training(hp)

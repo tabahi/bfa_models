@@ -74,6 +74,7 @@ class ComposedModel(L.LightningModule):
             attn_radius=int(getattr(self.hp, 'attn_radius', 0)),
             attn_heads=int(getattr(self.hp, 'attn_heads', 8)),
             block_dropout=float(getattr(self.hp, 'block_dropout', 0.1)),
+            local_delta=int(getattr(self.hp, 'local_delta', 0)),
         )
 
         self._resolve_geometry()
@@ -108,6 +109,13 @@ class ComposedModel(L.LightningModule):
         # Soft targets: 0 = hard-EM on the Viterbi path alone (see loss.alignment_occupancy).
         self.loss_fn.soft_target_mix = float(getattr(self.hp, 'soft_target_mix', 0.0))
         self.loss_fn.soft_target_scale = float(getattr(self.hp, 'soft_target_scale', 0.3))
+        # Soft ONSETS: the same occupancy moved onto the boundary positions instead of onto
+        # the class distribution, so the hat - and its fixed, geometric entropy - survives.
+        # See the `loss` module docstring; the two are mutually exclusive.
+        self.loss_fn.soft_onset_mix = float(getattr(self.hp, 'soft_onset_mix', 0.0))
+        self.loss_fn.soft_onset_ramp_k = float(getattr(self.hp, 'soft_onset_ramp_k', 0.0))
+        r_max = getattr(self.hp, 'soft_onset_ramp_max', None)
+        self.loss_fn.soft_onset_ramp_max = None if r_max is None else float(r_max)
 
     def _resolve_geometry(self):
         '''
@@ -142,11 +150,122 @@ class ComposedModel(L.LightningModule):
         self.save_hyperparameters(self.hp)
         self.last_epoch_time = time.time()
 
+    # ------------------------------------------------------------------ the EMA teacher
+
+    def ema_active(self):
+        '''Whether targets come from the teacher rather than from the live weights.'''
+        return float(getattr(self.hp, 'ema_decay', 0.0)) > 0.0
+
+    def ema_net(self):
+        '''
+        The teacher: an EMA copy of `self.model`, used ONLY to build the alignment.
+
+        ## Why a teacher at all
+
+        The objective is `CE(p, target(align(stopgrad p)))`. Every self-consistent pair of
+        (posterior, segmentation) is a stationary point of that, so nothing in it prefers the
+        TRUE segmentation - and the measurements say the loop drifts: over four warm-started
+        runs `frame_acc` went 0.52 -> 0.69 (the model agreeing with itself) while TIMIT
+        `nobonus_f1_25ms` fell 72.7 -> 63.5. Building the target from weights the model had
+        ~1/(1-decay) steps ago means a drift has to survive an averaging window to persist,
+        instead of being confirmed on the very next step.
+
+        This also averages over the SGD trajectory rather than over alignments at one set of
+        weights, which is what the earlier soft-EM attempt did - and why that one produced a
+        target SHARPER than the hat instead of a softer one.
+
+        ## Why it is held in a dict
+
+        `nn.Module.__setattr__` auto-registers any `nn.Module` it is assigned, so a plain
+        `self._ema = deepcopy(self.model)` would put the teacher in `state_dict()` and every
+        checkpoint written before this existed would fail the strict load in
+        `on_load_checkpoint`. Same reasoning as `_mel_flux`'s `_mel_cache`, one step stronger.
+        '''
+        box = self.__dict__.get('_ema_box')
+        if box is None or box['net'] is None:
+            import copy
+            net = copy.deepcopy(self.model).eval().requires_grad_(False)
+            self.__dict__['_ema_box'] = box = {'net': net}
+        return box['net']
+
+    def on_train_start(self):
+        '''
+        Build the teacher here, never in `build_model`: it must be a copy of the weights AFTER
+        the warm start has loaded and after DDP has broadcast rank 0, or the ranks would start
+        from different teachers and the targets would disagree across the batch.
+        '''
+        if self.ema_active():
+            net = self.ema_net()
+            pending = self.__dict__.pop('_ema_pending', None)
+            try:
+                net.load_state_dict(pending if pending is not None
+                                    else self.model.state_dict())
+                if pending is not None:
+                    print("EMA teacher restored from the checkpoint")
+            except RuntimeError as e:      # architecture grew on the warm start
+                print(f"EMA teacher could not be restored ({e.__class__.__name__}); "
+                      f"restarting it from the live weights")
+                net.load_state_dict(self.model.state_dict())
+            d = float(self.hp.ema_decay)
+            try:
+                spe = len(self.trainer.datamodule.train_dataloader())
+                spe = max(1, spe // max(1, int(getattr(self.hp, 'accumulate_grad_batches', 1))))
+            except Exception:
+                spe = 0
+            horizon = 1.0 / max(1e-9, 1.0 - d)
+            extra = f" = {horizon / spe:.2f} epoch" if spe else ""
+            print(f"EMA teacher on: decay {d}, averaging horizon ~{horizon:.0f} optimiser "
+                  f"steps{extra} ({spe} steps/epoch). Targets come from the teacher; the probe "
+                  f"stays on the live model.")
+            # The decay is only meaningful relative to the step count, and the step count is
+            # not obvious: `limit_data` caps FILES while the dataset is SEGMENTS, so an epoch
+            # can be several times longer than the clip count suggests. Both ends are failures
+            # that look like "the change did nothing", so name them here rather than after a
+            # run: too long and the teacher never leaves the warm start, too short and it
+            # tracks the student closely enough to damp nothing.
+            if spe and horizon > 3 * spe:
+                print(f"   WARNING: the horizon is {horizon / spe:.1f} EPOCHS, so the teacher "
+                      f"will barely move and training will effectively align against the warm "
+                      f"start. Try ema_decay ~{1 - 1 / (0.5 * spe):.3f} (half an epoch).")
+            elif spe and horizon < 0.15 * spe:
+                print(f"   WARNING: the horizon is {horizon / spe:.2f} of an epoch, so the "
+                      f"teacher tracks the student too closely to damp anything. Try "
+                      f"ema_decay ~{1 - 1 / (0.5 * spe):.3f} (half an epoch).")
+        return super().on_train_start()
+
+    def on_before_zero_grad(self, optimizer):
+        '''
+        Advance the teacher once per OPTIMISER step.
+
+        Not per micro-batch: this hook fires after `optimizer.step()`, so with
+        `accumulate_grad_batches: 2` a per-batch update would silently halve the averaging
+        horizon relative to what `ema_decay` says.
+        '''
+        if not self.ema_active():
+            return
+        d = float(self.hp.ema_decay)
+        n = int(self.global_step)
+        # Warmup, the standard one: at step 0 the teacher IS the student, so a warm start
+        # produces exactly the targets it produced before, and the teacher only lags once
+        # there is a trajectory to average.
+        d = min(d, (1.0 + n) / (10.0 + n))
+        net = self.ema_net()
+        with torch.no_grad():
+            for p_e, p in zip(net.parameters(), self.model.parameters()):
+                p_e.lerp_(p.detach().float(), 1.0 - d)
+            # BatchNorm running stats are already an EMA, and `num_batches_tracked` is an
+            # integer counter that must not be interpolated. Copy both.
+            for b_e, b in zip(net.buffers(), self.model.buffers()):
+                b_e.copy_(b)
+
     def on_save_checkpoint(self, checkpoint):
         checkpoint['model_config'] = self.model.save_config_state_dict()
+        if self.ema_active() and bool(getattr(self.hp, 'ema_in_checkpoint', True)):
+            checkpoint['ema_state'] = {k: v.detach().cpu()
+                                       for k, v in self.ema_net().state_dict().items()}
         return checkpoint
 
-    ADDITIVE_ARCH_KEYS = {'attn_radius', 'attn_heads', 'frame_blocks'}
+    ADDITIVE_ARCH_KEYS = {'attn_radius', 'attn_heads', 'frame_blocks', 'local_delta'}
 
     def on_load_checkpoint(self, checkpoint):
         '''
@@ -163,8 +282,9 @@ class ComposedModel(L.LightningModule):
 
         The one exception: a yaml list of ADDITIVE architecture keys the live yaml may change on
         a warm start (`ADDITIVE_ARCH_KEYS`). Each only adds `FrameBlock` parameters whose
-        residual output is zero-initialised, so the grown model computes exactly what the
-        checkpoint computed until training moves them. The added
+        residual output is zero-initialised (or the zero-initialised `delta_proj`), so the
+        grown model computes exactly what the checkpoint computed until training moves them.
+        The added
         parameters are taken from the freshly built model, and anything missing from the
         checkpoint that is NOT such a parameter still fails the strict load.
         '''
@@ -181,10 +301,20 @@ class ComposedModel(L.LightningModule):
                 raise ValueError(f"warm_start_arch_overrides: {key!r} is not additive; only "
                                  f"{sorted(self.ADDITIVE_ARCH_KEYS)} can change on a warm start")
             overrides[key] = getattr(live_hp, key)
+        # The quiet failure: the yaml asks for an additive change but does not list it, so the
+        # checkpoint's shape wins and the run trains the old architecture under the new name.
+        for key in sorted(self.ADDITIVE_ARCH_KEYS - set(overrides)):
+            want = getattr(live_hp, key, None) if live_hp is not None else None
+            have = (saved or {}).get(key, 0)
+            if want is not None and saved and want != have:
+                print(f"   WARNING: yaml {key}={want} but the checkpoint has {have}, and {key} "
+                      f"is not in warm_start_arch_overrides - building the CHECKPOINT's {have}.")
         if saved and overrides:
             grown = {**saved, **overrides}
             if int(grown.get('frame_blocks', 0)) < int(saved.get('frame_blocks', 0)):
                 raise ValueError("warm_start_arch_overrides cannot remove frame_blocks")
+            if int(grown.get('local_delta', 0)) < int(saved.get('local_delta', 0)):
+                raise ValueError("warm_start_arch_overrides cannot remove local_delta")
             print("Warm start GROWS the checkpoint's architecture (zero-initialised additions):")
             for k in overrides:
                 print(f"   {k}: checkpoint={saved.get(k, 0)} -> yaml={overrides[k]}")
@@ -212,6 +342,8 @@ class ComposedModel(L.LightningModule):
 
                 def is_addition(k):
                     parts = k.split('.')
+                    if parts[:2] == ['model', 'delta_proj']:
+                        return True
                     if parts[:2] != ['model', 'blocks']:
                         return False
                     return int(parts[2]) >= old_blocks or parts[3] in ('attn', 'attn_norm')
@@ -222,6 +354,14 @@ class ComposedModel(L.LightningModule):
                 for k in added:
                     checkpoint['state_dict'][k] = own[k]
                 print(f"   {len(added)} added tensors start from their zero-initialised values")
+
+        # A teacher saved by a previous run, stashed for `on_train_start` because the model is
+        # rebuilt above and the copy must be made from the final architecture. `.get` and not
+        # `[...]`: every checkpoint written before the teacher existed must keep loading, and
+        # it simply restarts the EMA from the live weights, which is a harmless warm restart.
+        self.__dict__['_ema_pending'] = checkpoint.get('ema_state')
+        if self.__dict__['_ema_pending'] is not None:
+            print("   checkpoint carries an EMA teacher; it will be restored")
 
     def configure(self, ph_seq_max, train_wav_len_max, val_wav_len_max=None,
                   train_total=0, val_total=0, test_total=0, main_node=True):
@@ -314,12 +454,15 @@ class ComposedModel(L.LightningModule):
     # ------------------------------------------------------------------ forward
 
     def encode_clip(self, audio_batch, max_frames=None, return_embeddings=False,
-                    return_flux=False):
+                    return_flux=False, net=None):
         '''
         Windowed forward over a whole clip.
 
         Args:
             audio_batch: [B, 1, L] padded waveforms
+            net: the network to run, defaulting to `self.model`. Only the EMA teacher passes
+                anything else; the geometry, the stitching and `_mel_flux` are all
+                weight-independent, so nothing else changes.
             max_frames: valid frames the caller actually needs, i.e. `spectral_lens.max()`.
                 Windows past that are pure zero padding, so they are not computed at all and
                 their frames come back as zeros. `SegmentsCollator` pads every clip to
@@ -380,12 +523,13 @@ class ComposedModel(L.LightningModule):
                                           self.window_size_ms, self.stride_ms)
         b, n_win, win_len = windows.shape
 
+        net = net if net is not None else self.model
         flux_source = str(getattr(self.hp, 'boundary_flux_source', 'tap'))
         if return_flux and flux_source == 'tap':
-            emb, tap = self.model.encode(windows.reshape(-1, win_len), return_tap=True)
+            emb, tap = net.encode(windows.reshape(-1, win_len), return_tap=True)
         else:
-            emb = self.model.encode(windows.reshape(-1, win_len))
-        logits_c, logits_g = self.model.classify(emb)
+            emb = net.encode(windows.reshape(-1, win_len))
+        logits_c, logits_g = net.classify(emb)
         if logits_c.shape[1] != self.frames_per_window:
             raise ValueError(f"expected {self.frames_per_window} frames per window, "
                              f"got {logits_c.shape[1]}")
@@ -445,6 +589,162 @@ class ComposedModel(L.LightningModule):
         flux[:, 1:n] = (lm[:, 1:n] - lm[:, :n - 1]).norm(dim=-1)
         return flux
 
+    @torch.no_grad()
+    def _average_views(self, alignment, audio_batch, wav_lens, ph_seqs, grp_seq, ph_seq_lens):
+        '''
+        Replace the teacher's onsets with their average over `aug_views` warped views, and
+        their spread with the LAW OF TOTAL VARIANCE over the same views:
+
+            sigma^2  =  mean(within-view variance)  +  variance(between-view means)
+
+        The second term is what makes this worth the forward pass. Views that agree leave the
+        ramp where it was; views that disagree widen it, and `soft_onset_ramp_k` then teaches
+        that boundary softly instead of committing to one view's guess. So the augmentation
+        feeds the ramp rather than fighting the CE - there is no consistency PENALTY anywhere,
+        which is deliberate: an equivariance penalty on its own is minimised by a constant
+        posterior, and this construction cannot ask for that.
+
+        Off by default (`aug_views: 0`), and unlike stages 1 and 2 it rests on no measurement
+        in this project yet. `scripts`-free check first: see `aug_warp_range` in the yaml.
+        '''
+        n = int(getattr(self.hp, 'aug_views', 0))
+        if n <= 0 or alignment is None or 'soft_onsets' not in alignment:
+            return
+        mus = [alignment['soft_onsets']]
+        vrs = [alignment['onset_sigma'].pow(2)]
+        for _ in range(n):
+            mu, var, feas = self._warped_onsets(audio_batch, wav_lens, ph_seqs, grp_seq,
+                                                ph_seq_lens)
+            if mu is None:
+                return
+            # A clip the warped view could not align at all contributes its unwarped values,
+            # so it is neither dropped from the batch nor given a garbage onset.
+            keep = feas[:, None]
+            mus.append(torch.where(keep, mu, mus[0]))
+            vrs.append(torch.where(keep, var, vrs[0]))
+        m = torch.stack(mus)
+        alignment['soft_onsets'] = m.mean(0)
+        alignment['onset_sigma'] = (torch.stack(vrs).mean(0)
+                                    + m.var(0, unbiased=False)).clamp(min=0.0).sqrt()
+
+    @torch.no_grad()
+    def _warped_onsets(self, audio_batch, wav_lens, ph_seqs, grp_seq, ph_seq_lens):
+        '''
+        The teacher's expected onsets on a time-warped copy of the batch, mapped back onto the
+        original frame grid. Returns (mean [B, S + 1], variance [B, S + 1], feasible [B]), or
+        three Nones when warping is off.
+
+        ## What this is for
+
+        Everything else in the objective is self-referential: the target is a function of the
+        model, so a segmentation that is self-consistent and systematically wrong is a fixed
+        point and nothing inside the loss can see it. Time warping is one of the few
+        constraints on the TRUE segmentation that does not come from the model - resample the
+        audio and every boundary must move with it.
+
+        It is not a general cure, and the reason is worth stating: a bias that is a constant
+        FRACTION of a phone's duration commutes with the warp and stays invisible. A bias that
+        is a constant number of FRAMES does not, because after warping it would have to become
+        `r` times as many frames to stay consistent. The measured failure here is the second
+        kind - the onset bonus pulls boundaries onto stop bursts, and the far misses skew early
+        929 to 561 - so this is aimed at the bias that was actually observed.
+
+        The mapping is exact, with no interpolation of anything: warping is a pure scaling of
+        the sample axis, frame `f` sits on sample `f * frame_stride_samples` with no offset
+        term (see `samples_to_frames`), and the onsets are a [B, S + 1] tensor. So the whole
+        correction is one multiply - nothing resamples a posterior.
+        '''
+        x = float(getattr(self.hp, 'aug_warp_range', 0.0))
+        if x <= 0.0:
+            return None, None, None
+        import torchaudio
+        r = float(torch.empty(1).uniform_(1.0 - x, 1.0 + x))
+        new_sr = max(1, int(round(self.sample_rate / r)))
+        r_eff = self.sample_rate / new_sr             # the rate actually applied
+        wav = audio_batch.reshape(audio_batch.shape[0], -1).float()
+        warped = torchaudio.functional.resample(wav, self.sample_rate, new_sr)[:, None, :]
+        w_lens = (wav_lens.float() / r_eff).round().long().clamp(min=1, max=warped.shape[-1])
+        s_lens = self.calc_spec_len(w_lens)
+
+        need_flux = bool(self.loss_fn.bonus_weight)
+        c, _, _, *fl = self.encode_clip(warped, max_frames=int(s_lens.max()),
+                                        return_flux=need_flux, net=self.ema_net())
+        lp = F.log_softmax(c.float(), dim=2)
+        al = self.loss_fn.align(lp, ph_seqs, grp_seq, ph_seq_lens,
+                                s_lens.clamp(max=lp.shape[1]),
+                                prior_weight=self.prior_weight_now(),
+                                flux=fl[0] if fl else None, with_occupancy=True)
+        # Back onto the original grid: a warped frame is `r_eff` original frames wide, so the
+        # mean scales and the variance scales by the square.
+        return al['soft_onsets'] * r_eff, (al['onset_sigma'] * r_eff).pow(2), al['feasible']
+
+    def _repr_flux_loss(self, emb, audio_batch, spectral_lens):
+        '''
+        Keep the representation's frame-to-frame change correlated with log-mel change.
+
+        ## The problem this is aimed at
+
+        Transcript-free boundary f1@25 on the probe's 200 clips: parameter-free log-mel flux
+        60.3, the model's own final embedding 51.8 and falling, the model's posterior dip 35.8
+        and falling, random init 29.9. The learnt representation carries LESS boundary
+        information than raw log-mel and training removes more of it every epoch, because the
+        identity objective rewards being INVARIANT to exactly the acoustic change that marks a
+        boundary. No rearrangement of the target reaches that: the information is gone before
+        the target is applied.
+
+        ## Why this is not the flux hinge, the boundary head or the partition CE
+
+        All three of those were rejected with measurements, and all three told the model WHERE
+        A BOUNDARY IS - so they imported the flux's placement bias, which is real and large
+        (the onset bonus costs 7 points per phone overall, 9 on vowels, 30 on reduced vowels
+        after stops, because it drags onsets onto stop bursts).
+
+        This one never mentions boundaries. It constrains the EMBEDDING, not the posteriors,
+        and that distinction is the whole argument: a stop burst is a large acoustic change
+        INSIDE one transcribed phone, so a term on the posteriors would fight the CE there,
+        which is exactly how the flux hinge went destructive. A term on the embedding does not
+        - the embedding is free to move while the classifier maps both sides to the same
+        phone. It says "do not throw the change away", and leaves "is this a phone boundary"
+        entirely to the CE and the transcript.
+
+        ## The form
+
+        Pearson correlation per clip, so it is invariant to the scale and offset of both
+        signals: it asks the two to have the same SHAPE, never the same magnitude, and it is
+        bounded in [-1, 1] so the weight cannot blow up. The mel side is
+        `_mel_flux` - no parameters, so it cannot drift the way the learned tap did (pa01c:
+        56.6 -> 54.1 over one run).
+
+        Returns (weighted loss, correlation) or (None, None) when the term is off.
+        '''
+        w = float(getattr(self.hp, 'repr_flux_weight', 0.0))
+        if w <= 0.0 or emb is None:
+            return None, None
+        t_full = emb.shape[1]
+        with torch.no_grad():
+            target = self._mel_flux(audio_batch, t_full)          # [B, T], parameter-free
+        e = F.normalize(emb.float(), dim=-1)
+        # Same convention as `loss.embedding_delta`: entry t is the change ENTERING frame t,
+        # so entry 0 compares nothing and is excluded below along with the padding.
+        delta = F.pad(1.0 - (e[:, 1:] * e[:, :-1]).sum(-1), (1, 0), value=0.0)
+
+        idx = torch.arange(t_full, device=emb.device)[None, :]
+        mask = ((idx >= 1) & (idx < spectral_lens[:, None])).to(delta.dtype)
+        n = mask.sum(1).clamp(min=1.0)
+
+        def _standardise(x):
+            mu = (x * mask).sum(1, keepdim=True) / n[:, None]
+            xc = (x - mu) * mask
+            var = xc.pow(2).sum(1, keepdim=True) / n[:, None]
+            return xc / var.clamp(min=1e-8).sqrt()
+
+        corr = (_standardise(delta) * _standardise(target) * mask).sum(1) / n
+        keep = mask.sum(1) > 2                      # a clip too short to have a shape at all
+        if not bool(keep.any()):
+            return None, None
+        corr = corr[keep].mean()
+        return w * (1.0 - corr), corr.detach()
+
     def prior_weight_now(self):
         '''
         Diagonal-prior weight for the current epoch: 1 -> 0 linearly over
@@ -465,8 +765,33 @@ class ComposedModel(L.LightningModule):
         # Lengths first: they say how much of the padded clip is worth computing at all.
         spectral_lens = self.calc_spec_len(wav_lens)
         need_flux = bool(self.loss_fn.bonus_weight) and mode != 'predict'
-        logits_c, logits_g, _, *flux = self.encode_clip(
-            audio_batch, max_frames=int(spectral_lens.max()), return_flux=need_flux)
+
+        # --- the teacher's alignment, before the student's graph exists -------------------
+        # Built first and freed first, so its activations never overlap the student's backward
+        # graph. Validation deliberately keeps aligning with the LIVE model, so val_peak_kl
+        # and val_frame_acc keep their historical meaning as self-agreement measures.
+        alignment = None
+        if mode == 'train' and self.ema_active():
+            with torch.no_grad():
+                t_c, _, _, *t_flux = self.encode_clip(
+                    audio_batch, max_frames=int(spectral_lens.max()),
+                    return_flux=need_flux, net=self.ema_net())
+                t_lp = F.log_softmax(t_c.float(), dim=2)
+                t_lens = spectral_lens.clamp(max=t_lp.shape[1])
+                alignment = self.loss_fn.align(
+                    t_lp, ph_seqs, grp_seq, ph_seq_lens, t_lens,
+                    prior_weight=self.prior_weight_now(),
+                    flux=t_flux[0] if t_flux else None,
+                    with_occupancy=(self.loss_fn.soft_target_mix > 0
+                                    or self.loss_fn.soft_onset_mix > 0))
+                del t_c, t_lp, t_flux
+                self._average_views(alignment, audio_batch, wav_lens, ph_seqs, grp_seq,
+                                    ph_seq_lens)
+
+        need_emb = float(getattr(self.hp, 'repr_flux_weight', 0.0)) > 0.0
+        logits_c, logits_g, emb, *flux = self.encode_clip(
+            audio_batch, max_frames=int(spectral_lens.max()), return_flux=need_flux,
+            return_embeddings=need_emb)
         flux = flux[0] if flux else None
         log_probs_c = F.log_softmax(logits_c.float(), dim=2)
         log_probs_g = F.log_softmax(logits_g.float(), dim=2)
@@ -477,7 +802,22 @@ class ComposedModel(L.LightningModule):
 
         loss, stats, alignment = self.loss_fn(
             log_probs_c, log_probs_g, ph_seqs, grp_seq, ph_seq_lens, spectral_lens,
-            prior_weight=self.prior_weight_now() if mode == 'train' else 0.0, flux=flux)
+            prior_weight=self.prior_weight_now() if mode == 'train' else 0.0, flux=flux,
+            alignment=alignment)
+
+        # Added in both train and val so `val_loss` stays a measure of the whole objective.
+        # `repr_flux_corr` is the number to read: if it does not rise, the term is inert; if it
+        # rises while `peak_ce` rises with it, identity and change sensitivity are trading off
+        # and the weight is too high.
+        rf_loss, rf_corr = self._repr_flux_loss(emb, audio_batch, spectral_lens)
+        if rf_loss is not None:
+            loss = loss + rf_loss
+            stats['repr_flux_corr'] = rf_corr
+            stats['repr_flux_loss'] = rf_loss.detach()
+        if mode == 'train' and self.model.delta_proj is not None:
+            # ||delta branch|| / ||embedding branch|| at the classifier's hidden layer. Stuck
+            # near 0 = the head never learned to use it; the dip should only move once it is not.
+            stats['delta_share'] = self.model.delta_share
 
         for key, value in stats.items():
             self.log(f'{mode}_{key}', value, prog_bar=False, on_step=False,
@@ -663,12 +1003,7 @@ class ComposedModel(L.LightningModule):
             gb = 2 ** 30
             alloc = torch.cuda.max_memory_allocated() / gb
             reserved = torch.cuda.max_memory_reserved() / gb
-            self.log('gpu_peak_alloc_gb', alloc, prog_bar=False, on_step=False,
-                     on_epoch=True, rank_zero_only=True)
-            self.log('gpu_peak_reserved_gb', reserved, prog_bar=False, on_step=False,
-                     on_epoch=True, rank_zero_only=True)
-            self.log('gpu_frag_pct', 100.0 * (reserved - alloc) / max(alloc, 1e-6),
-                     prog_bar=False, on_step=False, on_epoch=True, rank_zero_only=True)
+
             if self.main_node:
                 print(f"[mem] rank {self.global_rank}: peak allocated {alloc:.1f} GB, "
                       f"reserved {reserved:.1f} GB ({100 * (reserved - alloc) / max(alloc, 1e-6):.0f}% held)")
@@ -695,7 +1030,16 @@ class ComposedModel(L.LightningModule):
             lr=lr, weight_decay=float(getattr(self.hp, 'weight_decay', 0.01)),
             betas=(0.9, 0.999), eps=1e-8)
 
-        steps_per_epoch = len(self.trainer.datamodule.train_dataloader())
+        # BATCHES per epoch is not what OneCycle wants. The scheduler is stepped on
+        # `interval: 'step'`, and Lightning steps it once per OPTIMISER step, so with
+        # `accumulate_grad_batches: 2` passing the batch count builds a cycle twice as long as
+        # the run - it peaks halfway through and the anneal never happens. Measured on pb01a:
+        # 176 batches x 10 epochs = 1760 configured against 880 actual steps, so the lr was
+        # still 4e-5 at the end of training and the metric dip at epochs 6-8 tracked the lr
+        # peak rather than anything in the loss.
+        accum = max(1, int(self.trainer.accumulate_grad_batches))
+        batches = len(self.trainer.datamodule.train_dataloader())
+        steps_per_epoch = -(-batches // accum)             # ceil, as Lightning counts them
         if steps_per_epoch < 1:
             raise ValueError("steps_per_epoch < 1: batch size too big or dataset too small")
         scheduler = optim.lr_scheduler.OneCycleLR(

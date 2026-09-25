@@ -148,7 +148,12 @@ def _onsets_ms(aligned, silence_class=SILENCE_CLASS):
 
 @torch.no_grad()
 def score_model(pl_module, cache, batch_size=16, tolerances=DEFAULT_TOLERANCES,
-                align_max_dist=100.0, max_clips=None):
+                align_max_dist=100.0, max_clips=None, onset_trace=None):
+    '''
+    `onset_trace`: an optional dict, filled with `{clip index: [refined onset frames]}`. The
+    probe re-aligns the SAME fixed clips every epoch, so diffing two of these measures how far
+    the segmentation moved - independently of which training shard a rank happened to see.
+    '''
     if max_clips is not None:
         cache = cache[:max_clips]
 
@@ -220,6 +225,8 @@ def score_model(pl_module, cache, batch_size=16, tolerances=DEFAULT_TOLERANCES,
                 pred = _onsets_ms([(ph, raw * ms) for ph, raw, _ in keep])
                 if not pred:
                     continue
+                if onset_trace is not None:
+                    onset_trace[start + i] = [float(ref) for _, _, ref in keep]
                 dec.add(known, pred, align_max_dist)
                 if nobonus[i]:
                     nb = nobonus[i]
@@ -276,6 +283,31 @@ class TimitAlignProbe(L.Callback):
         self.max_clips = max_clips
         self.enabled = enabled
         self._cache = None
+        self._prev_onsets = None
+
+    def _drift(self, trace):
+        '''
+        How far this epoch's segmentation moved from last epoch's, on the same fixed clips.
+
+        The objective builds its own targets, so it has two failure modes that look identical
+        on the loss curve and opposite on this one. Drift decaying towards zero while the f1
+        falls means the EM loop CONVERGED, to the wrong place - the remaining lever is outside
+        the objective. Drift staying flat or growing means it never converged at all, and the
+        target recipe is still moving under the model.
+
+        Only clips whose phone count is unchanged are compared, so a clip that became
+        infeasible is dropped rather than counted as an enormous move.
+        '''
+        prev = self._prev_onsets
+        if not prev or not trace:
+            return {}
+        deltas = [abs(a - b) for k, cur in trace.items()
+                  for a, b in zip(cur, prev.get(k, ())) if len(prev.get(k, ())) == len(cur)]
+        if not deltas:
+            return {}
+        deltas.sort()
+        return {'onset_drift_frames': sum(deltas) / len(deltas),
+                'onset_drift_p95_frames': deltas[min(len(deltas) - 1, int(0.95 * len(deltas)))]}
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if not self.enabled or trainer.sanity_checking:
@@ -286,8 +318,12 @@ class TimitAlignProbe(L.Callback):
         try:
             if self._cache is None:
                 self._cache = load_cache(self.cache_path)
+            trace = {}
             results = score_model(pl_module, self._cache, batch_size=self.batch_size,
-                                  tolerances=self.tolerances, max_clips=self.max_clips)
+                                  tolerances=self.tolerances, max_clips=self.max_clips,
+                                  onset_trace=trace)
+            results.update(self._drift(trace))
+            self._prev_onsets = trace
         except Exception as exc:                       # never let the probe kill a run
             if getattr(pl_module, 'main_node', True):
                 print(f"WARN: TIMIT probe failed this epoch: {type(exc).__name__}: {exc}")
@@ -313,3 +349,7 @@ class TimitAlignProbe(L.Callback):
                   f"bonusflux f1@25={results['bonusflux_f1_25ms']:.2f} | "
                   f"no-bonus f1@25={results['nobonus_f1_25ms']:.2f} | "
                   f"tune half sub f1@25={results['tune_sub_f1_25ms']:.2f}")
+            if 'onset_drift_frames' in results:
+                print(f"[TIMIT probe]   alignment moved "
+                      f"{results['onset_drift_frames']:.2f} frames since last epoch "
+                      f"(p95 {results['onset_drift_p95_frames']:.2f})")

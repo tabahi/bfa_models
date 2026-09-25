@@ -51,7 +51,7 @@ over the first epochs. At weight 1 the alignment is essentially "divide the clip
 phone count", which is precisely a flat start. Warm starting from a trained checkpoint? Set
 `align_prior_epochs: 0`.
 
-## Soft targets (`soft_target_mix`)
+## Soft targets (`soft_target_mix`) - the entropy trap
 
 Hard-EM trains the model towards ONE path, so wherever the aligner is unsure (gradual
 transitions: glides, laterals, vowel onsets) the model is taught a committed guess and then
@@ -59,6 +59,45 @@ aligns more confidently on it next time. `alignment_occupancy` gives the posteri
 paths on the same decoder instead; `soft_target_mix` blends it into the target (1 = pure
 soft-EM). `soft_target_scale` < 1 tempers the path score. Lower values spread occupancy over
 more legal alignments and eventually make the boundary target less precise.
+
+**This knob is a trap at 1.0 and the measurements say so.** `_soft_target` multiplies the hat
+by `1 - mix`, so at mix 1.0 the hat is not mixed down, it is arithmetically DELETED - and with
+it `ramp_frames`, the 0.5 crossing, and the only thing keeping the target honest. The hat's
+entropy is a function of the SEGMENTATION GEOMETRY alone, so it is pinned at ~0.17 nats and
+cannot move. The occupancy's entropy is a function of the MODEL'S OWN CONFIDENCE, so it shrinks
+as the model sharpens:
+
+    sharper posteriors -> sharper occupancy -> harder target -> sharper posteriors
+
+Measured over four consecutive warm-started runs at `soft_target_mix: 1.0`: target entropy
+0.086 -> 0.070, `occupancy_peak` 0.962 -> 0.969, `frame_acc` 0.52 -> 0.69 (the model agreeing
+with itself), while TIMIT `nobonus_f1_25ms` fell 72.7 -> 63.5 and `dip_f1_25ms` fell 39.8 ->
+37.2 against a 29.9 random-init floor. Every self-referential number improved and the only one
+scored against real labels collapsed. Leave this at 0 and use `soft_onset_mix`.
+
+## Soft ONSETS (`soft_onset_mix`) - the same averaging, without the entropy
+
+The fix is to change WHERE the occupancy is mixed in. Mixed into the frame class distribution
+it destroys the hat; mixed into the ONSET POSITIONS it does not. `occupancy_to_onsets` reads
+`E[onset_i]` and its spread off the same occupancy, the hat is rebuilt around those fractional
+onsets, and the target's entropy goes back to being geometric and fixed.
+
+Three things follow, and the first is the reason this is worth doing at all:
+
+  - the target now carries SUB-FRAME boundary positions, which an integer hat cannot. That is
+    what `refine_onsets` reads, so it is finally being trained against something it can see
+    rather than always against a half-integer;
+  - the boundary moves CONTINUOUSLY between steps instead of jumping a whole frame, which by
+    itself damps the oscillation hard-EM produces;
+  - `soft_onset_ramp_k` widens the ramp in proportion to the onset's own standard deviation, so
+    a boundary the aligner is unsure about is taught softly instead of as a committed guess.
+    That is a NEGATIVE feedback: a confused model gets softer targets, a confident one relaxes
+    back to the `ramp_frames` floor. It is the variant the earlier soft-EM run never actually
+    tested (at scale 0.3 its target came out SHARPER than the hat, so it tested "no ramp").
+
+Honest limit: where the model is confidently WRONG - two thirds of the far misses have a
+posterior onset spread under 10 ms - none of this helps. It stops new errors being locked in;
+it does not repair old ones.
 
 ## Optional silence
 
@@ -526,6 +565,74 @@ def path_to_onsets(phone_idx, input_lens, n_positions):
     return (pi[:, :, None] < cols).sum(dim=1)
 
 
+@torch.no_grad()
+def occupancy_to_onsets(gamma, chunk=16):
+    '''
+    Expected fractional onsets and their spread, from the forward-backward occupancy.
+
+    The soft twin of `path_to_onsets`. That one COUNTS the frames the single best path put
+    before each phone; this one sums the PROBABILITY of the same event. The topology is
+    monotonic, so frame `t` belongs to a phone before `i` exactly when phone `i` starts after
+    `t`, which makes the survival function a plain cumulative sum over phones:
+
+        S[t, i]        = P(onset_i > t) = sum_{s < i} gamma[t, s]
+        E[onset_i]     = sum_t S[t, i]
+        E[onset_i^2]   = sum_t (2t + 1) S[t, i]          (X >= 0 and integer-valued)
+
+    so both moments are reductions of a tensor that already exists. Three properties make the
+    result a drop-in for `path_to_onsets` rather than an approximation of it: `E[onset_i]` is
+    non-decreasing in `i` (the inner sum only gains non-negative terms), `E[onset_0] = 0`, and
+    `E[onset_S] = sum_{t,s} gamma = T`, so the row still partitions the clip exactly.
+
+    The moments are taken in float64, in batch chunks. This is not defensive: at T = 2000,
+    `E[X^2]` is ~4e6 while the variance can be O(1), and float32 carries seven digits - the
+    subtraction would lose the answer completely and come back NEGATIVE, so `sigma` would be
+    NaN and every downstream ramp with it. `chunk` bounds the float64 temporary (16 clips x
+    2000 frames x 67 positions = 17 MB).
+
+    Args:
+        gamma: [B, T, S] from `alignment_occupancy`, already zeroed past each clip's end and
+            on infeasible clips, so no length mask is needed here.
+    Returns:
+        onsets [B, S + 1] float, sigma [B, S + 1] float, both in frames.
+    '''
+    b, t, s = gamma.shape
+    device = gamma.device
+    wgt = 2.0 * torch.arange(t, device=device, dtype=torch.float64) + 1.0
+    mu = torch.zeros(b, s + 1, device=device, dtype=torch.float64)
+    m2 = torch.zeros(b, s + 1, device=device, dtype=torch.float64)
+    for lo in range(0, b, chunk):
+        sl = slice(lo, min(b, lo + chunk))
+        # Exclusive cumsum over phones: entry i is the mass on phones < i, i.e. S[t, i].
+        surv = F.pad(gamma[sl].cumsum(-1), (1, 0)).double()             # [n, T, S + 1]
+        mu[sl] = surv.sum(1)
+        m2[sl] = (surv * wgt[None, :, None]).sum(1)
+    sigma = (m2 - mu.pow(2)).clamp(min=0.0).sqrt()
+    return mu.float(), sigma.float()
+
+
+@torch.no_grad()
+def onsets_to_phone_idx(onsets, ext_lens, t_max):
+    '''
+    Inverse of `path_to_onsets`: which phone each frame belongs to, given (fractional) onsets.
+
+    A boundary sits at `onset - 0.5` in frame coordinates (see `peak_weights`), so frame `t`
+    belongs to phone `i` exactly when `onset_i <= t + 0.5 < onset_{i+1}` - one `searchsorted`.
+    `right=True` takes the LAST of a run of equal onsets, which is what makes a zero-length
+    (skipped) phone unreachable instead of swallowing the frames of the phone after it.
+
+    With integer onsets from a monotonic path this returns that path's `phone_idx` exactly, so
+    it is a no-op on the hard-EM route; the self-test asserts the round trip.
+
+    `onsets` must be non-decreasing along dim 1 - `searchsorted` does not check, it just
+    returns nonsense - so callers blending two onset estimates must `cummax` first.
+    '''
+    t = torch.arange(t_max, device=onsets.device, dtype=onsets.dtype) + 0.5
+    t = t.expand(onsets.shape[0], -1).contiguous()     # searchsorted copies it otherwise
+    idx = torch.searchsorted(onsets.contiguous(), t, right=True) - 1
+    return idx.clamp(min=0).minimum((ext_lens - 1).clamp(min=0)[:, None])
+
+
 # ----------------------------------------------------------------------------- the shape
 
 @torch.no_grad()
@@ -549,20 +656,34 @@ def peak_weights(phone_idx, onsets, ext_lens, ramp_frames=3.0):
     `ramp_frames` is the one number that trades identity against placement. Wide: mushy
     interiors, forgiving targets. Narrow: sharp, close to a hard label, and the interpolated
     crossing gets noisy. 3 frames = 15 ms each side at this frame rate, which is about the
-    length of a real coarticulated transition.
+    length of a real coarticulated transition. It may also be a [B, S + 1] tensor, one width
+    per BOUNDARY, which is how `soft_onset_ramp_k` widens the ramp where the aligner is unsure.
+
+    `onsets` may be integer (the Viterbi path) or float (the occupancy's expected onsets, see
+    `occupancy_to_onsets`); the arithmetic here is float either way, and a fractional onset is
+    exactly how a sub-frame boundary reaches the target.
 
     Returns:
         w [B, T] weight on the frame's own phone, partner [B, T] index of the other phone
     '''
     i = phone_idx
+    j = (i + 1).clamp(max=onsets.shape[1] - 1)
     left = onsets.gather(1, i).float() - 0.5
-    right = onsets.gather(1, (i + 1).clamp(max=onsets.shape[1] - 1)).float() - 0.5
+    right = onsets.gather(1, j).float() - 0.5
     t = torch.arange(phone_idx.shape[1], device=phone_idx.device).float()[None, :]
 
     dl = t - left
     dr = right - t
-    ramp = torch.minimum(torch.full_like(dl, float(ramp_frames)), (right - left) / 2)
-    w = 0.5 + 0.5 * (torch.minimum(dl, dr) / ramp.clamp(min=1e-3)).clamp(0.0, 1.0)
+    # One ramp width per BOUNDARY, not per phone, so the two phones meeting at a boundary use
+    # the same width there and the crossing stays at exactly 0.5. A per-phone width would let
+    # them disagree and move the crossing, which is the one quantity `refine_onsets` reads.
+    half = ((right - left) / 2).clamp(min=1e-3)
+    if torch.is_tensor(ramp_frames):
+        rl = torch.minimum(ramp_frames.gather(1, i).float(), half).clamp(min=1e-3)
+        rr = torch.minimum(ramp_frames.gather(1, j).float(), half).clamp(min=1e-3)
+    else:
+        rl = rr = torch.minimum(torch.full_like(dl, float(ramp_frames)), half).clamp(min=1e-3)
+    w = 0.5 + 0.5 * torch.minimum(dl / rl, dr / rr).clamp(0.0, 1.0)
 
     # The neighbour is the nearest phone the path actually VISITED. A skipped phone (an unused
     # optional or punctuation SIL) has no frames, so the phone across the boundary is the one
@@ -570,7 +691,14 @@ def peak_weights(phone_idx, onsets, ext_lens, ramp_frames=3.0):
     # `i - 1` used to hand ~40% of frame 0's target to a SIL that was never there.
     s = onsets.shape[1] - 1
     pos = torch.arange(s, device=phone_idx.device)[None, :]
-    visited = ((onsets[:, 1:] - onsets[:, :-1]) > 0) & (pos < ext_lens[:, None])
+    # Visited = the phone actually CAPTURES a frame, not merely that its duration is positive.
+    # Its first frame is `ceil(onset - 0.5)`, so it is non-empty iff its first frame differs
+    # from its successor's. With integer onsets `ceil(n - 0.5) == n`, so this is bit-identical
+    # to the old `diff > 0`; with FRACTIONAL onsets that test would mark a skipped optional SIL
+    # of expected duration 0.02 as visited, and frame 0 would go back to handing ~40% of its
+    # target to a SIL that is not there.
+    first = torch.ceil(onsets.float() - 0.5)
+    visited = (first[:, 1:] > first[:, :-1]) & (pos < ext_lens[:, None])
     before = F.pad(torch.where(visited, pos, -1), (1, 0), value=-1)[:, :-1]
     prev_visited = torch.cummax(before, dim=1).values                        # [B, S]
     after = F.pad(torch.where(visited, pos, s), (0, 1), value=s)[:, 1:]
@@ -598,18 +726,38 @@ class PeakLoss(nn.Module):
         soft_frames / soft_cost / sil_skippable / bonus_weight / contrast_frames: the
             segmental decoder's topology and flux bonus, see `viterbi_align` and
             `boundary_bonus`. All off by default.
+        soft_target_mix: mix the occupancy into the CLASS DISTRIBUTION. Leave at 0; at 1 it
+            deletes the hat and the target's entropy becomes a free variable. See the module
+            docstring for the four runs that measured what that does.
+        soft_onset_mix: mix the occupancy into the ONSET POSITIONS instead. 0 = the Viterbi
+            path's integer onsets, i.e. bit-identical to hard-EM.
+        soft_onset_ramp_k: widen each boundary's ramp by `k * sigma`, sigma being that onset's
+            own standard deviation under the occupancy. 0 = a constant `ramp_frames`.
+        soft_onset_ramp_max: cap on the widened ramp, in frames. A ramp wider than half a
+            phone turns it into a triangle whose peak is below 1.0, and the aligner then
+            scores short phones as CHEAPER (see `peak_weights`), so this cap is what stops
+            ramp widening from feeding the duration squeeze. None = no widening beyond
+            `ramp_frames`.
     '''
 
     def __init__(self, min_frames=2, ramp_frames=3.0, group_weight=0.3, optional_sil=True,
                  prior_sigma=0.1, prior_strength=1.0, sil_class=SIL_CLASS,
                  class_prior_norm=False, soft_frames=0, soft_cost=1.0, sil_skippable=False,
                  bonus_weight=0.0, contrast_frames=17, soft_target_mix=0.0,
-                 soft_target_scale=0.3):
+                 soft_target_scale=0.3, soft_onset_mix=0.0, soft_onset_ramp_k=0.0,
+                 soft_onset_ramp_max=None):
         super().__init__()
         # 0 = the hat target alone (hard-EM). >0 mixes in the forward-backward occupancy at
         # path-score scale `soft_target_scale`, see `alignment_occupancy` and `forward`.
         self.soft_target_mix = float(soft_target_mix)
         self.soft_target_scale = float(soft_target_scale)
+        # The same occupancy, used on the ONSETS instead of on the class distribution, so the
+        # hat survives and the target keeps its fixed geometric entropy. See the module
+        # docstring; these two are mutually exclusive and `forward` enforces that.
+        self.soft_onset_mix = float(soft_onset_mix)
+        self.soft_onset_ramp_k = float(soft_onset_ramp_k)
+        self.soft_onset_ramp_max = None if soft_onset_ramp_max is None \
+            else float(soft_onset_ramp_max)
         self.class_prior_norm = bool(class_prior_norm)
         self.soft_frames = int(soft_frames)
         self.soft_cost = float(soft_cost)
@@ -634,7 +782,11 @@ class PeakLoss(nn.Module):
         be a different decoder from the one configured.
 
         `with_occupancy` adds 'occupancy' [B, T, S]: the forward-backward posterior of each
-        phone position per frame, on the same decoder, at `soft_target_scale`.
+        phone position per frame, on the same decoder, at `soft_target_scale`; plus
+        'soft_onsets' and 'onset_sigma' [B, S + 1], its expected onsets and their spread.
+
+        'onsets' STAYS the integer Viterbi tensor whatever else is computed: `align_batch`,
+        `refine_onsets` and `_boundary_frames` all index with it, so its dtype is API.
         '''
         ext, ext_g, ext_lens, opt_head, opt_tail = prepare_targets(
             targets, group_targets, target_lens, self.sil_class, self.optional_sil)
@@ -663,6 +815,7 @@ class PeakLoss(nn.Module):
                 soft_cost=self.soft_cost, sil_skippable=self.sil_skippable,
                 sil_class=self.sil_class, onset_bonus=bonus, bonus_weight=self.bonus_weight,
                 scale=self.soft_target_scale)
+            out['soft_onsets'], out['onset_sigma'] = occupancy_to_onsets(out['occupancy'])
             out['feasible'] = feasible & occ_ok
         return out
 
@@ -680,17 +833,45 @@ class PeakLoss(nn.Module):
         Returns:
             (loss, stats dict, alignment dict)
         '''
-        soft = self.soft_target_mix > 0
+        soft_q = self.soft_target_mix > 0
+        soft_on = self.soft_onset_mix > 0
+        if soft_q and soft_on:
+            raise ValueError(
+                "soft_target_mix and soft_onset_mix are two different uses of the same "
+                "occupancy - mixing it into the class distribution (which deletes the hat and "
+                "its fixed entropy) or into the onsets (which does not). Pick one; see the "
+                "module docstring.")
+        need_occ = soft_q or soft_on
         with torch.no_grad():
-            if alignment is None or (soft and 'occupancy' not in alignment):
+            if alignment is None or (need_occ and 'occupancy' not in alignment):
                 alignment = self.align(log_probs.detach(), targets, group_targets,
                                        target_lens, input_lens, prior_weight, flux=flux,
-                                       with_occupancy=soft)
+                                       with_occupancy=need_occ)
             ext, ext_g = alignment['ext'], alignment['ext_groups']
             ext_lens, phone_idx = alignment['ext_lens'], alignment['phone_idx']
             onsets, feasible = alignment['onsets'], alignment['feasible']
 
-            w, partner = peak_weights(phone_idx, onsets, ext_lens, self.ramp_frames)
+            ramp, onsets_hat = self.ramp_frames, onsets
+            if soft_on:
+                m = self.soft_onset_mix
+                onsets_hat = (1 - m) * onsets.float() + m * alignment['soft_onsets']
+                # `searchsorted` does not check sortedness, it just returns nonsense, and a
+                # float blend can produce a -1e-7 step. Both guards are cheap.
+                onsets_hat = torch.cummax(onsets_hat.clamp(min=0.0), dim=1).values
+                onsets_hat = torch.minimum(onsets_hat, input_lens[:, None].float())
+                # Re-derive the frame->phone assignment from the onsets actually used. Keeping
+                # the Viterbi one would let a soft onset move past a frame that path assigned
+                # elsewhere: `min(dl, dr)` goes negative, the clamp pins w to exactly 0.5 over
+                # a stretch, and the crossing - the whole point - is flat instead of crossing.
+                phone_idx = onsets_to_phone_idx(onsets_hat, ext_lens, log_probs.shape[1])
+                if self.soft_onset_ramp_k > 0:
+                    r_max = self.ramp_frames if self.soft_onset_ramp_max is None \
+                        else self.soft_onset_ramp_max
+                    ramp = (self.ramp_frames
+                            + self.soft_onset_ramp_k * alignment['onset_sigma']).clamp(
+                                self.ramp_frames, float(r_max))
+
+            w, partner = peak_weights(phone_idx, onsets_hat, ext_lens, ramp)
             frame_ok = (torch.arange(log_probs.shape[1], device=log_probs.device)[None, :]
                         < input_lens[:, None]) & feasible[:, None]
             mask = frame_ok.to(log_probs.dtype)
@@ -713,7 +894,7 @@ class PeakLoss(nn.Module):
                 return q.scatter_add_(2, idx, self.soft_target_mix * occ)
 
             q_main = q_grp = None
-            if soft:
+            if soft_q:
                 q_main = _soft_target(log_probs.shape[2], main_cls, part_cls, ext)
                 if group_log_probs is not None:
                     q_grp = _soft_target(group_log_probs.shape[2], main_grp, part_grp, ext_g)
@@ -735,13 +916,19 @@ class PeakLoss(nn.Module):
         with torch.no_grad():
             # Entropy of the target itself. The CE cannot go below it, so `peak_kl` is the
             # part that can actually reach zero - read that, not the raw loss.
-            if soft:
+            wc = w.float().clamp(1e-6, 1 - 1e-6)
+            hat_ent = -(wc * wc.log() + (1 - wc) * (1 - wc).log())
+            if soft_q:
                 qc = q_main.clamp(min=1e-12)
                 ent = -(q_main * qc.log()).sum(-1)
             else:
-                wc = w.float().clamp(1e-6, 1 - 1e-6)
-                ent = -(wc * wc.log() + (1 - wc) * (1 - wc).log())
+                ent = hat_ent
             ent = (ent * mask).sum() / n_frames
+            # The hat's entropy depends on the SEGMENTATION GEOMETRY only, never on the model,
+            # so it is the fixed reference the real target entropy is read against. The ratio
+            # is the single number that says whether the target is running away with the
+            # model's confidence: 1.0 = pure hat, ~0.4 = what `soft_target_mix: 1.0` produced.
+            hat_ent = (hat_ent * mask).sum() / n_frames
             durations = (onsets[:, 1:] - onsets[:, :-1]).float()
             seg_ok = (torch.arange(durations.shape[1], device=durations.device)[None, :]
                       < ext_lens[:, None]) & feasible[:, None]
@@ -752,6 +939,12 @@ class PeakLoss(nn.Module):
                 'peak_ce': loss_main.detach(),
                 'peak_kl': loss_main.detach() - ent,
                 'target_entropy': ent,
+                'hat_entropy': hat_ent,
+                'target_entropy_ratio': ent / hat_ent.clamp(min=1e-6),
+                # How much of the gradient is about BOUNDARIES at all rather than phone
+                # identity. Falls as phones get longer, so it also reads the corpus: ~0.4 at
+                # libri's 16-frame mean phone, ~0.2 on an isolated-word source.
+                'ramp_frac': (((w.float() < 1.0 - 1e-6).float()) * mask).sum() / n_frames,
                 'mean_phone_frames': (durations * seg_ok).sum() / n_seg,
                 'min_dur_frac': (((durations > 0) & (durations <= self.min_frames)
                                   & speech).sum() / speech.sum().clamp(min=1)).float(),
@@ -765,10 +958,21 @@ class PeakLoss(nn.Module):
             }
             if loss_groups is not None:
                 stats['peak_ce_groups'] = loss_groups.detach()
-            if soft:
-                # How soft the occupancy half of the target is: 1.0 = no different from Viterbi.
+            if need_occ:
+                # How soft the occupancy is: 1.0 = no different from Viterbi.
                 occ = alignment['occupancy'][:, :mask.shape[1]]
                 stats['occupancy_peak'] = (occ.max(-1).values * mask).sum() / n_frames
+            if soft_on:
+                # Interior boundaries only: position 0 is the clip start and position
+                # `ext_lens` is its end, neither of which is a boundary anybody places.
+                bpos = torch.arange(onsets.shape[1], device=onsets.device)[None, :]
+                b_ok = (bpos >= 1) & (bpos < ext_lens[:, None]) & feasible[:, None]
+                n_b = b_ok.sum().clamp(min=1)
+                # Reads 0.0 if the occupancy at this `soft_target_scale` is just Viterbi, in
+                # which case soft onsets are a no-op and the knob is doing nothing.
+                shift = (alignment['soft_onsets'] - onsets.float()).abs()
+                stats['onset_shift_frames'] = (shift * b_ok).sum() / n_b
+                stats['onset_sigma_frames'] = (alignment['onset_sigma'] * b_ok).sum() / n_b
         return loss, stats, alignment
 
 
@@ -933,6 +1137,59 @@ if __name__ == "__main__":
                             torch.tensor(got[:int(ext_lens[0]) + 1]))
     print("refined:", [round(float(v), 2) for v in refined])
 
+    print("\n--- soft onsets: the occupancy's expectation, and the round trip ---")
+    hard_on = path_to_onsets(pi, torch.tensor([T]), ext.shape[1])
+    # `onsets_to_phone_idx` must invert `path_to_onsets` exactly, or swapping it in for the
+    # hard-EM route would silently move every frame's target.
+    back = onsets_to_phone_idx(hard_on.float(), ext_lens, T)
+    assert torch.equal(back, pi[:, :T]), (back[0].tolist(), pi[0, :T].tolist())
+    print("round trip path_to_onsets -> onsets_to_phone_idx: identical")
+    for sc in (0.3, 1.0, 50.0):
+        g, ok = alignment_occupancy(lp, ext, ext_lens, torch.tensor([T]), min_frames=2,
+                                    opt_head=oh, opt_tail=ot, scale=sc)
+        so, sig = occupancy_to_onsets(g)
+        print(f"  scale {sc:>4}: onsets {[round(float(v), 2) for v in so[0]]}  "
+              f"sigma {[round(float(v), 2) for v in sig[0]]}")
+        assert torch.all(so[:, 1:] >= so[:, :-1] - 1e-4), "expected onsets must be monotone"
+        assert abs(float(so[0, -1]) - T) < 1e-2, ("the row must still partition the clip", so)
+        assert torch.isfinite(sig).all() and float(sig.min()) >= 0.0, sig
+        if sc >= 50.0:
+            # scale -> inf collapses the occupancy onto the Viterbi path, so the expectation
+            # must collapse onto that path's integer onsets.
+            assert float((so - hard_on.float()).abs().max()) < 0.01, (so, hard_on)
+    print("  scale 50 matches the Viterbi onsets; float64 moments keep sigma finite")
+
+    print("\n--- a fractional boundary reaches the target, and the crossing stays at 0.5 ---")
+    # Planted boundary at 5.9 (onset 6.4): the target's own crossing must land there.
+    on_f = torch.tensor([[0.0, 6.4, 20.0, 20.0, 20.0]])
+    pif = onsets_to_phone_idx(on_f, torch.tensor([2]), 20)
+    wf, pf = peak_weights(pif, on_f, torch.tensor([2]), ramp_frames=3.0)
+    q0 = torch.where(pif[0] == 0, wf[0], 1 - wf[0])          # target mass on phone 0
+    d = (1 - q0) - q0                                        # crosses zero at the boundary
+    k = int(torch.nonzero(d[:-1] * d[1:] < 0)[0])
+    cross = k + float(d[k] / (d[k] - d[k + 1]))
+    print(f"  target crossing at frame {cross:.3f} (planted 5.900)")
+    assert abs(cross - 5.9) < 1e-3, cross
+    # Per-boundary ramps: the two phones meeting at a boundary use the SAME width there, so a
+    # widened ramp softens the target without moving the crossing. Both phones must be at
+    # least 2 * ramp long, otherwise `half` clips one side and only one side widens - which is
+    # the asymmetry `soft_onset_ramp_max` exists to bound.
+    def _crossing(idx, ons, ramp):
+        wv, _ = peak_weights(idx, ons, torch.tensor([2]), ramp_frames=ramp)
+        q = torch.where(idx[0] == 0, wv[0], 1 - wv[0])
+        dd = (1 - q) - q
+        kk = int(torch.nonzero(dd[:-1] * dd[1:] < 0)[0])
+        return kk + float(dd[kk] / (dd[kk] - dd[kk + 1])), wv
+
+    on_w = torch.tensor([[0.0, 16.4, 34.0, 34.0, 34.0]])     # both phones >= 14 frames
+    pw = onsets_to_phone_idx(on_w, torch.tensor([2]), 34)
+    c_narrow, w_narrow = _crossing(pw, on_w, 3.0)
+    c_wide, w_wide = _crossing(pw, on_w, torch.tensor([[3.0, 7.0, 3.0, 3.0, 3.0]]))
+    print(f"  crossing at ramp 3: {c_narrow:.3f}   at ramp 7: {c_wide:.3f}  (planted 15.900)")
+    assert abs(c_narrow - 15.9) < 1e-3 and abs(c_wide - 15.9) < 1e-3, (c_narrow, c_wide)
+    assert float(w_wide[0, 13]) < float(w_narrow[0, 13]), "a wider ramp must soften the target"
+    print("  a per-boundary ramp widens the target without moving the crossing")
+
     print("\n--- loss decreases towards its own target ---")
     loss_fn = PeakLoss(min_frames=2, ramp_frames=3.0, group_weight=0.3)
     logits = torch.zeros(1, T, C, requires_grad=True)
@@ -986,4 +1243,44 @@ if __name__ == "__main__":
     assert not bool(al['feasible'][3]) and bool(al['feasible'][0])
     assert torch.isfinite(loss), loss
     print(f"  loss={float(loss):.4f} infeasible_frac={float(stats['infeasible_frac']):.2f}")
+
+    print("\n--- soft onsets in the loss ---")
+    # The regression gate: at soft_onset_mix 0 the new code path must reduce to the old one
+    # EXACTLY, not approximately, or none of the A/B numbers mean anything.
+    base = PeakLoss(min_frames=2, ramp_frames=3.0, group_weight=0.3)
+    g1, g2 = torch.Generator().manual_seed(1), torch.Generator().manual_seed(2)
+    lp_r = F.log_softmax(torch.randn(B, T, C, generator=g1), dim=-1)
+    glp_r = F.log_softmax(torch.randn(B, T, 5, generator=g2), dim=-1)
+    l0, s0, _ = base(lp_r, glp_r, seqs, grps, slens, lens)
+    assert float(s0['target_entropy_ratio']) == 1.0, s0['target_entropy_ratio']
+    print(f"  mix 0 (the old path): loss={float(l0):.6f}  "
+          f"entropy_ratio={float(s0['target_entropy_ratio']):.3f}  "
+          f"ramp_frac={float(s0['ramp_frac']):.3f}")
+
+    soft = PeakLoss(min_frames=2, ramp_frames=3.0, group_weight=0.3,
+                    soft_onset_mix=1.0, soft_onset_ramp_k=1.0, soft_onset_ramp_max=6.0)
+    l2, s2, _ = soft(lp_r, glp_r, seqs, grps, slens, lens)
+    print(f"  mix 1 + ramp k=1: loss={float(l2):.4f}  "
+          f"entropy_ratio={float(s2['target_entropy_ratio']):.3f}  "
+          f"shift={float(s2['onset_shift_frames']):.2f} frames  "
+          f"sigma={float(s2['onset_sigma_frames']):.2f} frames")
+    assert torch.isfinite(l2), l2
+    # The whole point: whatever the occupancy does, the target stays a hat, so its entropy is
+    # geometric and the ratio is pinned at 1. That is exactly what `soft_target_mix: 1.0` gave
+    # up, and the reason the alignment drifted.
+    assert abs(float(s2['target_entropy_ratio']) - 1.0) < 1e-5, s2['target_entropy_ratio']
+    assert float(s2['onset_sigma_frames']) >= 0.0
+
+    hard = PeakLoss(min_frames=2, ramp_frames=3.0, group_weight=0.3, soft_target_mix=1.0)
+    _, sh, _ = hard(lp_r, glp_r, seqs, grps, slens, lens)
+    print(f"  soft_target_mix 1 for contrast: entropy_ratio="
+          f"{float(sh['target_entropy_ratio']):.3f} (the target the hat is measured against)")
+
+    try:
+        PeakLoss(soft_target_mix=0.5, soft_onset_mix=0.5)(
+            lp_r, glp_r, seqs, grps, slens, lens)
+        raise AssertionError("using the occupancy two ways at once must raise")
+    except ValueError as e:
+        print(f"  both mixes on -> ValueError: {str(e)[:50]}...")
+
     print("\nloss.py self-test OK")
