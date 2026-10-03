@@ -79,13 +79,10 @@ import splits
 
 def run_training(hp):
     print("Data source:", hp.data_src)
-    paths_list, total_hours, val_data = splits.get_splits(hp.data_src, dev_mode=False)
-    val_paths_list = val_data[0] if val_data else None
-    print(paths_list[0])
-    if hp.limit_data:
-        paths_list = paths_list[:hp.limit_data]
-        if val_paths_list:
-            val_paths_list = val_paths_list[:int(hp.limit_data*0.25)]
+    paths_list, total_hours, val_data = splits.get_splits(hp.data_src, train_limit=hp.train_limit, val_limit=hp.val_limit, test_limit=hp.test_limit, dev_run=hp.dev_run)
+    val_paths_list = val_data[0]
+    assert (os.path.exists(paths_list[-1]['audio']))
+    assert (os.path.exists(val_paths_list[-1]['audio']))
 
     torch.manual_seed(hp.seed)
     torch.set_float32_matmul_precision('medium')
@@ -139,10 +136,9 @@ def run_training(hp):
         logger=wandb_logger)
 
     dm = MyDataModule(hp.phoneme_classes, hp.dataloader_n_workers, hp.batch_size)
-    if val_paths_list is not None:
-        dm.load_paths_parts(train_paths=paths_list, val_paths=val_paths_list)
-    else:
-        dm.load_paths_split(paths_list, split_at=([0.1, 0.12] if hp.dev_run else [0.98, 1]))
+    dm.load_paths_parts(train_paths=paths_list, val_paths=val_paths_list)
+
+    
     dm.setup('fit', duration_max=hp.duration_max, ph_seq_max=hp.ph_seq_max, regen_cache=False,
              val_max_segments=int(getattr(hp, 'val_max_segments', 0)))
 

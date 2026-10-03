@@ -19,8 +19,8 @@ seed: 42                # Random seed.
 batch_size: 108         # Clips processed at once on each GPU. Lower this if GPU memory is full.
 accumulate_grad_batches: 2 # Update after this many batches. Larger values increase effective batch size.
 dataloader_n_workers: 2 # CPU workers that prepare audio.
-limit_data: 0           # 0 = all files. 10000 (~176 steps/epoch) was for fast diagnostics only.
-
+train_limit: 100000           # null = all files. 
+val_limit: 1000             # null = all files. 
 # true = every batch has the same padded shape and uses predictable GPU memory.
 # false = shorter batches can use less memory, but memory use will vary from batch to batch.
 fixed_window_batch: true

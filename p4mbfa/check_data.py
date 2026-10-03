@@ -50,7 +50,7 @@ def check_g2p_import():
 def run():
     #check_g2p_import()
     
-    paths_list, total_hours, val_data = splits.get_splits('fleurs', dev_mode=False)
+    paths_list, total_hours, val_data = splits.get_splits('fleurs_dev')
     val_paths_list = val_data[0] if val_data else None
     
     from standard_g2p import lang_group_inventory as LGI
@@ -78,7 +78,6 @@ def run():
     n_gold_ph = GP.phoneme_inventory_gold.N_TOKENS
     n_gold_phg = GP.phoneme_features.N_GROUPS
 
-    
     # filter conditions
     min_duration = 0.5
     max_duration = 30.0
@@ -127,13 +126,15 @@ def run():
                 segment_skipped_count += 1
                 continue
 
+            lang_group_data = LGI.to_local(segment['gold_ph'], lang, segment['gold_ph_count'])
+            tone = LGI.expand(segment['tone'], lang_group_data['local_ph_count'])   # len(tone) == len(t['local_ph'])
             
-            lang_group_data = LGI.to_local(segment['gold_ph'], lang)
             #print(f"Lang {lang}, tokens: {tokens}")
             assert lang_group_data is not None, f"Failed to convert gold_ph to local tokens for lang {lang}"
             assert lang_group_data['lang_group'] == selected_lang_group, f"Lang group mismatch: expected {selected_lang_group}, got {lang_group_data['lang_group']}"
             assert lang_group_data['n_local_ph'] == n_tokens, f"Mismatch in n_local_ph for lang {lang}: expected {n_tokens}, got {lang_group_data['n_local_ph']}"
             local_tokens = lang_group_data['local_ph']
+            
 
             # skip if too  many phonemes are back-offed to <unk> after lang-group conversion. 
             n_fold_ratio = lang_group_data['n_folded'] / n_tokens

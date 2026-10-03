@@ -14,3 +14,6 @@ speech_data_manager_paths_manager: data/paths_manager_example # an example of pa
  # This way, if you move the metadata files to a different location, you only need to change this one path in local_paths.py, and all the relative paths in the paths_list json files will still work.
   # Note that this does not apply to raw source audio files. It's only for metadata files generateed/used by this repo.
 metadata_base: /path/to/metadata_base
+# p4mbfa only: checkout of the standard_g2p repo (CharsiuG2P fork). Its tables convert gold labels
+# to language-group labels at load time.
+standard_g2p_repo: /path/to/CharsiuG2P
