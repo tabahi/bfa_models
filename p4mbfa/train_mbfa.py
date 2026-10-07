@@ -81,13 +81,13 @@ def load_paths(hp):
 
     train_paths, total_hours, val_data = splits.get_splits(hp.data_src, train_limit=1000 if hp.dev_run else hp.train_limit, val_limit=hp.val_limit)
 
-    train_paths = filter_paths_by_lang_group(train_paths, hp.lang_group)
+    train_paths = filter_paths_by_lang_group(train_paths, hp.lang_group, hp.exclude_langs)
 
 
     if not val_data:
         raise ValueError(f"{hp.data_src} has no val split")
     
-    val_paths = filter_paths_by_lang_group(val_data[0], hp.lang_group)
+    val_paths = filter_paths_by_lang_group(val_data[0], hp.lang_group, hp.exclude_langs)
 
 
     assert (os.path.exists(train_paths[-1]['audio']))

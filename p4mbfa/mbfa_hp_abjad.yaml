@@ -1,0 +1,151 @@
+# Main training configuration for p4mbfa.
+# Run with: /root/anaconda3/bin/python p4mbfa/train_mbfa.py p4mbfa/mbfa_hp [key=value ...]
+#
+# Every key below is required: the code reads them without defaults, so a missing key raises
+# instead of silently taking a value from somewhere else.
+
+experiment: "mp01a"
+note: "first abjad run: trunk + phg_head from latin ma02a, fresh ph_head (90) and tone_head"
+project: "mbfa"
+
+# Basic run settings.
+gpu_num: [0, 1]
+data_src: "fleurs"     # splits.get_splits source. Must have .gs.json files next to its .srt.json.
+epochs: 30              # Also the OneCycle length. fleurs abjad (ar ckb fa sd ur) is ~38 h
+                        # at duration_max 20: ~133 optimiser steps per epoch at batch 44 on 2 GPUs.
+                        # cjk, cyrillic and japanese all reached their best val_loss at epoch 9-13,
+                        # just after the OneCycle lr peak (epoch 9 of 30).
+dev_run: false          # true = run only a tiny test. Use this after changing the config.
+seed: 42
+
+# Batch and memory settings.
+batch_size: 44          # Clips per GPU, padded to duration_max (20 s). Measured peak allocated,
+                        # one GPU, bf16: frame_blocks 4 -> 0.71 GB/clip (60 clips = 42.3 GB),
+                        # frame_blocks 8 -> 1.02 GB/clip (40 clips = 40.7 GB).
+accumulate_grad_batches: 1
+dataloader_n_workers: 4
+train_limit: null           # null = all files. get_splits samples a limit from ALL of fleurs (161127
+                            # train files) BEFORE the lang_group filter: 100000 kept only 62% of every
+                            # group. Keep null: no group has data to spare.
+val_limit: null             # null = all files; same caveat (1464 abjad val files with null).
+test_limit: null            # null = all files. Read by train_mbfa.py's splits.get_splits call.
+fixed_window_batch: true
+cuda_alloc_conf: ""
+sample_rate: 16000      # Audio must already be at this rate; the collator raises otherwise.
+
+# ------------------------------------------------------------------ label spaces
+# The collator checks every one of these against standard_g2p's tables and against each .gs.json
+# header, and raises on any mismatch.
+lang_group: "abjad" # which language group's local_ph the ph_head predicts
+n_tokens: 90             # local tokens of lang_group, INCLUDING <blank> SIL noise <unk>
+exclude_langs: []  # member languages to leave out, as the paths list spells them.
+                        # none for this group.
+n_tones: 22             # tone values, shared by every language (0 = no tone)
+n_phg: 15               # gold phoneme groups, shared by every language: the FIXED head
+
+# Replace the two fine heads (ph_head, tone_head) when loading ckpt_path. true = the checkpoint's
+# fine heads are DISCARDED and fresh ones are built for lang_group / n_tokens / n_tones above;
+# the trunk and phg_head are kept. false = the checkpoint's fine heads must already match, or the
+# load raises. Needs ckpt_path.
+reset_fine_heads: true  # latin (208 tokens) -> abjad (90): new ph_head and tone_head
+
+# ------------------------------------------------------------------ data filters (check_data.py)
+duration_min: 0.5       # seconds
+duration_max: 20        # seconds; ALSO the padding width. FLEURS latin keeps 94.6% at 20 s, 99.4%
+                        # at 30 s (check_data.py's value) for 1.5x the compute per clip.
+ph_seq_min: 5           # fewest local tokens a segment may have
+ph_seq_max: 320         # most local tokens; the longest segment <= 20 s has 277
+tokens_per_sec_min: 2.0
+tokens_per_sec_max: 20.0
+max_fold_frac: 0.05     # most of a segment's tokens that may have folded to <unk>
+skip_tonal: true        # no abjad language has a tone layer; nothing is skipped
+skip_unsegmented: true  # no abjad language needs word segmentation; nothing is skipped
+min_kept_frac: 0.9      # raise if fewer of the files or segments survive the filters
+regen_cache: false      # true = rebuild the collator cache even if one exists
+
+# Validation files. splits.get_splits('fleurs') returns the SAME list as train and val, so val is
+# held out of the train list instead: every Nth file, which covers every language. 0 = use the
+# splits' val list (the run raises if it overlaps train).
+
+val_max_segments: 400   # Maximum validation clips used each epoch.
+
+# ------------------------------------------------------------------ audio windows
+window_size_ms: 120
+window_stride_ms: 80    # Must line up with the 5 ms frame grid.
+
+# ------------------------------------------------------------------ model (trunk = p3cupe's)
+# These must equal trunk_init_path's / ckpt_path's trunk; a mismatch raises.
+cnn_channels: 192
+embed_dim: 512
+context_kernels: [5, 3]
+frame_blocks: 4         # Per-frame depth: capacity WITHOUT widening the 38.9 ms receptive field.
+                        # 4 = p3cupe (13.8M params), 8 = 22.2M (ma01a-c; their TIMIT f1 peaked by
+                        # epoch 5-13 and then declined). 8-block checkpoints cannot load here.
+grow_frame_blocks: false # true = a checkpoint (ckpt_path or trunk_init_path) with FEWER blocks may
+                        # load; the extra blocks start as the identity, so the grown model computes
+                        # exactly what the checkpoint did. false = any block-count mismatch raises.
+ffn_mult: 4
+block_dropout: 0.3
+attn_radius: 0
+attn_heads: 8
+cnn_dropout: 0.2
+head_dropout: 0.3
+noise_level: 0.02
+
+# ------------------------------------------------------------------ loss and alignment
+# p3cupe's final recipe (pc01a), unchanged.
+min_phone_frames: 6
+soft_phone_frames: 10
+soft_frame_cost: 1.0
+sil_skippable: true
+boundary_bonus_weight: 30.0
+boundary_contrast_frames: 17
+boundary_flux_source: mel
+ramp_frames: 1.0
+optional_sil: true
+class_prior_norm: true
+
+group_loss_weight: 0.3  # phg head (gold_phg, cross-lingual)
+tone_loss_weight: 0.3   # tone head, over clips whose tone layer is real only. No abjad clip
+                        # has one, so this term is 0 here (train_tone_frame_frac = 0), as on latin.
+
+soft_onset_mix: 1.0     # 0 = one best alignment (hard-EM)
+soft_target_scale: 0.3  # path-score scale of the occupancy, used only when soft_onset_mix > 0
+soft_onset_ramp_k: 0.0
+soft_onset_ramp_max: 6.0
+
+# Cold-start alignment help. All three heads start from random weights (only the trunk is
+# pretrained), so the first alignments are read off a random ph_head: pull them towards even
+# durations for the first epochs.
+align_prior_epochs: 2
+align_prior_sigma: 0.03
+align_prior_strength: 1.0
+
+# ------------------------------------------------------------------ TIMIT probe (validation only)
+# The cache is in lang_group's local tokens; build it with p4mbfa/timit_probe_prep.py. TIMIT is
+# English, so the probe exists only for 'latin'. A missing or mismatched cache raises at startup.
+timit_probe_enabled: false
+timit_probe_cache: "tmp/data/timit_probe_400_latin.json"
+timit_probe_batch_size: 16
+timit_probe_every_n_epochs: 1
+
+# ------------------------------------------------------------------ optimizer
+lr: 1e-4                # Fresh heads on a pretrained trunk; p3cupe's warm starts used 5e-5.
+weight_decay: 0.01
+gradient_clip_val: 1.0
+
+# ------------------------------------------------------------------ checkpoints
+ckpt_monitor: "val_loss"  # no TIMIT probe for abjad (TIMIT is English), so no boundary metric
+ckpt_mode: "min"
+early_stop_metric: "val_loss"
+early_stop_mode: "min"
+patience: 3000
+
+# Where the weights come from. At most one of the two may be set.
+#   ckpt_path:        a p4mbfa checkpoint (full model; see reset_fine_heads)
+#   trunk_init_path:  any p3cupe or p4mbfa checkpoint; ONLY its trunk is loaded, all heads fresh
+# Both empty = train from random weights (raise align_prior_epochs and lr for that).
+ckpt_path: "tmp/training/p4mbfa/ma02a/m_ma02a_final_e30.pt"   # with reset_fine_heads: keeps phg_head
+trunk_init_path: null
+
+# /root/anaconda3/bin/python p4mbfa/train_mbfa.py p4mbfa/mbfa_hp_abjad

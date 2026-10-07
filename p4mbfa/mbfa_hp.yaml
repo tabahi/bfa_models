@@ -4,8 +4,8 @@
 # Every key below is required: the code reads them without defaults, so a missing key raises
 # instead of silently taking a value from somewhere else.
 
-experiment: "ma03a"
-note: "ramp_frames: 1.0 noise level 0.05 ph_head 2 layers"
+experiment: "ma04a"
+note: "no data limits"
 project: "mbfa"
 
 # Basic run settings.
@@ -22,8 +22,10 @@ batch_size: 44          # Clips per GPU, padded to duration_max (20 s). Measured
                         # frame_blocks 8 -> 1.02 GB/clip (40 clips = 40.7 GB).
 accumulate_grad_batches: 1
 dataloader_n_workers: 4
-train_limit: 100000           # null = all files. 
-val_limit: 1000             # null = all files. 
+train_limit: null           # null = all files. get_splits samples a limit from ALL of fleurs (161127
+                            # train files) BEFORE the lang_group filter: 100000 kept only 62% of every
+                            # group. Keep null: no group has data to spare.
+val_limit: null             # null = all files; same caveat (10447 latin val files with null).
 test_limit: null            # null = all files. Read by train_mbfa.py's splits.get_splits call.
 fixed_window_batch: true
 cuda_alloc_conf: ""
@@ -34,6 +36,8 @@ sample_rate: 16000      # Audio must already be at this rate; the collator raise
 # header, and raises on any mismatch.
 lang_group: "latin"     # which language group's local_ph the ph_head predicts
 n_tokens: 208           # local tokens of lang_group, INCLUDING <blank> SIL noise <unk>
+exclude_langs: []  # member languages to leave out, as the paths list spells them.
+                        # none for this group.
 n_tones: 22             # tone values, shared by every language (0 = no tone)
 n_phg: 15               # gold phoneme groups, shared by every language: the FIXED head
 

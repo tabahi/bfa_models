@@ -113,16 +113,34 @@ def verify_inventory(lang_group, n_tokens, n_tones, n_phg):
     return tokens
 
 
-def filter_paths_by_lang_group(paths_list, lang_group):
-    '''Keep the files whose language belongs to `lang_group` (check_data.py's first filter).'''
+def filter_paths_by_lang_group(paths_list, lang_group, exclude_langs=()):
+    '''
+    Keep the files whose language belongs to `lang_group` (check_data.py's first filter), minus
+    `exclude_langs` (the yaml's list of language codes, as the paths list spells them).
+
+    Exclusion is for a member language whose labels are unusable in its group - Khmer in
+    thai_khmer folds ~20% of its tokens to <unk>, so every one of its segments would be filtered
+    and the group would fall below `min_kept_frac`. Each excluded code must be a member of
+    `lang_group` (a typo raises), and how many files it removed is printed.
+    '''
     if lang_group not in LGI.list_all_lang_groups:
         raise ValueError(f"unknown lang_group {lang_group!r}; known: {LGI.list_all_lang_groups}")
-    kept = [p for p in paths_list if LGI.lang_group_of(p['lang']) == lang_group]
+    exclude = set(exclude_langs or ())
+    strangers = sorted(code for code in exclude if LGI.lang_group_of(code) != lang_group)
+    if strangers:
+        raise ValueError(f"exclude_langs {strangers} are not members of lang_group {lang_group!r}")
+    members = [p for p in paths_list if LGI.lang_group_of(p['lang']) == lang_group]
+    kept = [p for p in members if p['lang'] not in exclude]
     if not kept:
-        raise ValueError(f"no file in the paths list belongs to lang_group {lang_group!r}")
+        raise ValueError(f"no file in the paths list belongs to lang_group {lang_group!r}"
+                         + (f" after excluding {sorted(exclude)}" if exclude else ""))
     langs = Counter(p['lang'] for p in kept)
     print(f"lang_group {lang_group!r}: {len(kept)} of {len(paths_list)} files, "
           f"{len(langs)} languages: {dict(sorted(langs.items()))}")
+    if exclude:
+        dropped = Counter(p['lang'] for p in members if p['lang'] in exclude)
+        print(f"   exclude_langs removed {sum(dropped.values())} files: "
+              f"{ {code: dropped.get(code, 0) for code in sorted(exclude)} }")
     return kept
 
 
