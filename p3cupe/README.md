@@ -14,6 +14,16 @@ The main idea is:
 
 The model is therefore both a phoneme recognizer and a boundary detector.
 
+## Published model
+
+`Tabahi/CUPE-3-en` on Hugging Face is pa07f epoch 0 (LibriSpeech 500 h): TIMIT f1@25ms 76.10
+tune / 75.58 holdout with the decoder in its `config.json` (min 6 + soft 10 frames, onset
+bonus 30), the best p3cupe checkpoint when all are re-scored that way. Load it with
+`model.CupeExtractor("Tabahi/CUPE-3-en")` (also takes a release directory or a training
+checkpoint). It is built by `p3cupe/export_hf.py` from the entry in
+[`p4mbfa/hf_release.yaml`](../p4mbfa/hf_release.yaml) and pushed with
+`python p4mbfa/export_hf.py push --only CUPE-3-en`. p3cupe is superseded by p4mbfa.
+
 ## Run It
 
 ```bash

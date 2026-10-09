@@ -1,5 +1,6 @@
-# Main training configuration for p4mbfa.
-# Run with: /root/anaconda3/bin/python p4mbfa/train_mbfa.py p4mbfa/mbfa_hp [key=value ...]
+# Training configuration for the cjk language group of p4mbfa. What each setting does, and what
+# raising or lowering it changes, is explained in mbfa_hp.yaml (same keys).
+# Run with: python p4mbfa/train_mbfa.py p4mbfa/mbfa_hp_cjk [key=value ...]
 #
 # Every key below is required: the code reads them without defaults, so a missing key raises
 # instead of silently taking a value from somewhere else.
@@ -92,7 +93,7 @@ head_dropout: 0.3
 noise_level: 0.02
 
 # ------------------------------------------------------------------ loss and alignment
-# p3cupe's final recipe (pc01a), unchanged.
+# p3cupe's final recipe (pc01a) except ramp_frames (3.0 there); see mbfa_hp.yaml.
 min_phone_frames: 6
 soft_phone_frames: 10
 soft_frame_cost: 1.0
@@ -147,4 +148,4 @@ patience: 3000
 ckpt_path: "tmp/training/p4mbfa/ma02a/m_ma02a_final_e30.pt"   # with reset_fine_heads: keeps phg_head
 trunk_init_path: null
 
-# /root/anaconda3/bin/python p4mbfa/train_mbfa.py p4mbfa/mbfa_hp_cjk
+# python p4mbfa/train_mbfa.py p4mbfa/mbfa_hp_cjk

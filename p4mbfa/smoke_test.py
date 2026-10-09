@@ -1,12 +1,13 @@
 '''
 End-to-end check of the p4mbfa package on synthetic audio - no dataset, no GPU required.
 
-    /root/anaconda3/bin/python p4mbfa/smoke_test.py
+    python p4mbfa/smoke_test.py
 
 Covers what `dev_run: true` would cover outside the data pipeline: geometry, a train step with a
 backward that reaches all three heads, validation, the forced-alignment readout, the checkpoint
-rules (strict reload, fine-head mismatch raising, `reset_fine_heads`, trunk-only init from a
-p3cupe checkpoint), and one TIMIT probe pass if the cache is present.
+rules (strict reload, fine-head mismatch raising, `reset_fine_heads`, `grow_frame_blocks`,
+trunk-only init from a p3cupe checkpoint), the release path (`export_hf.py` -> `MbfaAligner` must
+reproduce the trainer exactly), and one TIMIT probe pass if the cache is present.
 '''
 
 import os
@@ -206,6 +207,8 @@ def check_checkpoints(model, batch, wav_lens, n_phones):
         except ValueError:
             print("a trunk shape mismatch raises")
 
+        check_release(model, path, batch, d)
+
     # 6. Trunk-only init from the real p3cupe checkpoint (4 blocks), grown to the yaml's depth.
     p3 = P3CUPE_TRUNK
     if os.path.exists(p3):
@@ -233,6 +236,40 @@ def check_checkpoints(model, batch, wav_lens, n_phones):
             print(f"a p3cupe checkpoint as ckpt_path raises: {str(e)[:60]}...")
     else:
         print(f"(skipped the p3cupe trunk load: {p3} not found)")
+
+
+def check_release(model, ckpt_path, batch, tmp_dir):
+    '''
+    The published format: `export_hf.py` -> `MbfaAligner` must reproduce the trainer exactly -
+    the same posteriors and the same alignments - because both run `p4mbfa.clip`.
+    '''
+    from p4mbfa.export_hf import export
+    from p4mbfa.inference import MbfaAligner
+    print("\n--- release export and inference ---")
+    out = os.path.join(tmp_dir, 'release')
+    export(ckpt_path, out)
+    assert sorted(os.listdir(out)) == ['README.md', 'config.json', 'model.safetensors']
+    aligner = MbfaAligner.from_pretrained(out)
+    model.eval()
+    ph, _, _, _, audio, ph_lens, wav_lens = batch
+    with torch.no_grad():
+        mine = aligner.encode(audio, wav_lens, normalize=False)
+        theirs = model.encode_clip(audio, return_flux=True)
+    lp = torch.log_softmax(theirs[0].float(), dim=2)
+    for b in range(audio.shape[0]):
+        n = int(mine['frames'][b])
+        assert torch.allclose(mine['ph'][b, :n], lp[b, :n], atol=1e-5), b
+    n0 = int(wav_lens[0])
+    clip0 = audio[0, 0, :n0]
+    with torch.no_grad():
+        c, _, _, _, flux = model.encode_clip(clip0[None, None], return_flux=True)
+        nf = int(model.calc_spec_len(torch.tensor([n0]))[0])
+        ref = model.align_clip(torch.log_softmax(c.float(), 2)[0], ph[0, :int(ph_lens[0])], nf,
+                               flux=flux[0])
+    segs = aligner.align(clip0, ph[0, :int(ph_lens[0])].tolist(), normalize=False)
+    assert [(s['token_id'], s['start_ms']) for s in segs] == ref, "release alignment drifted"
+    print(f"release: config.json + model.safetensors + README.md; MbfaAligner matches the "
+          f"trainer ({len(segs)} aligned phones, identical onsets)")
 
 
 if __name__ == "__main__":

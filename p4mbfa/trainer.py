@@ -39,8 +39,8 @@ import torch.nn.functional as F
 from argparse import Namespace
 from torch import optim
 
-from p4mbfa import windowing
-from p4mbfa.loss import PeakLoss, refine_onsets
+from p4mbfa import clip
+from p4mbfa.loss import PeakLoss
 from p4mbfa.model import (FINE_HEAD_KEYS, FINE_HEAD_PREFIXES, REGULARISATION_KEYS,
                           TRUNK_PREFIXES, TRUNK_SHAPE_KEYS, MbfaCNN)
 
@@ -132,16 +132,12 @@ class ComposedModel(L.LightningModule):
 
     def _resolve_geometry(self):
         '''Pin down the frame grid, and refuse to run on one that does not divide evenly.'''
-        self.frames_per_window = int(self.model.frames_per_window)
-        self.frame_stride_samples = int(self.model.frame_stride_samples)
-        self.stride_frames, _, _ = windowing.frames_geometry(
-            window_size_ms=self.window_size_ms,
-            stride_ms=self.stride_ms,
-            sample_rate=self.sample_rate,
-            frames_per_window=self.frames_per_window,
-            frame_stride_samples=self.frame_stride_samples,
-        )
-        self.ms_per_frame = 1000.0 * self.frame_stride_samples / self.sample_rate
+        self.geometry = clip.ClipGeometry.for_model(self.model, self.sample_rate,
+                                                    self.window_size_ms, self.stride_ms)
+        self.frames_per_window = self.geometry.frames_per_window
+        self.frame_stride_samples = self.geometry.frame_stride_samples
+        self.stride_frames = self.geometry.stride_frames
+        self.ms_per_frame = self.geometry.ms_per_frame
         print(f"Geometry: {self.ms_per_frame:.4f} ms/frame, {self.frames_per_window} "
               f"frames/window, window advance {self.stride_frames} frames "
               f"({self.stride_ms} ms), receptive field "
@@ -290,105 +286,28 @@ class ComposedModel(L.LightningModule):
 
     def calc_spec_len(self, wav_lens):
         '''Valid stitched frames per clip, from the real sample lengths.'''
-        return windowing.spectral_lengths(
-            wav_lens, self.window_size_wav, self.stride_size_wav,
-            self.frames_per_window, self.stride_frames)
+        return self.geometry.spectral_lengths(wav_lens)
 
     # ------------------------------------------------------------------ forward
 
     def encode_clip(self, audio_batch, max_frames=None, return_embeddings=False,
                     return_flux=False):
         '''
-        Windowed forward over a whole clip.
+        Windowed forward over a whole clip; see `clip.encode_clip`, which this configures from
+        the yaml (`boundary_flux_source`, `fixed_window_batch`).
 
-        Args:
-            audio_batch: [B, 1, L] padded waveforms
-            max_frames: valid frames the caller actually needs, i.e. `spectral_lens.max()`;
-                windows past it are not computed. IGNORED when `fixed_window_batch` is set,
-                which keeps activation shapes (and GPU memory) constant - see p3cupe's notes.
-            return_flux: adds [B, T_full], the acoustic change ENTERING each frame, for the
-                aligner's onset bonus (`boundary_flux_source`: parameter-free log-mel, or the
-                model's own feature-extractor tap).
         Returns:
             (logits_ph, logits_phg, logits_tone, embeddings|None[, flux]), each [B, T_full, ...]
-            where T_full is what the PADDED clip length implies.
         '''
-        length = audio_batch.shape[-1]
-        n_full = windowing.num_windows_for(length, self.window_size_wav, self.stride_size_wav)
-        t_full = windowing.total_stitched_frames(n_full, self.frames_per_window,
-                                                 self.stride_frames)
-
-        if max_frames is not None and not self.fixed_window_batch:
-            # Every window that overlaps a needed frame, not merely enough to reach it.
-            need = (max(int(max_frames), 1) - 1) // self.stride_frames + 1
-            n_win = min(n_full, max(1, need))
-            audio_batch = audio_batch[..., :min(
-                length, (n_win - 1) * self.stride_size_wav + self.window_size_wav)]
-
-        windows = windowing.slice_windows(audio_batch, self.sample_rate,
-                                          self.window_size_ms, self.stride_ms)
-        b, n_win, win_len = windows.shape
-
-        flux_source = str(self.hp.boundary_flux_source)
-        if return_flux and flux_source == 'tap':
-            emb, tap = self.model.encode(windows.reshape(-1, win_len), return_tap=True)
-        else:
-            emb = self.model.encode(windows.reshape(-1, win_len))
-        logits = self.model.classify(emb)
-        if logits[0].shape[1] != self.frames_per_window:
-            raise ValueError(f"expected {self.frames_per_window} frames per window, "
-                             f"got {logits[0].shape[1]}")
-
-        def _stitch(x):
-            if x is None:
-                return None
-            out = windowing.stitch_windows(
-                x.reshape(b, n_win, self.frames_per_window, -1),
-                num_windows_total=n_win, frames_per_window=self.frames_per_window,
-                stride_frames=self.stride_frames)
-            pad = t_full - out.shape[1]
-            return F.pad(out, (0, 0, 0, pad)) if pad > 0 else out
-
-        out = tuple(_stitch(x) for x in logits) + (
-            _stitch(emb if return_embeddings else None),)
-        if not return_flux:
-            return out
-        if flux_source == 'mel':
-            return out + (self._mel_flux(audio_batch, t_full),)
-        with torch.no_grad():
-            e = F.normalize(tap.detach().float(), dim=-1)
-            flux = torch.zeros(e.shape[:2], device=e.device)
-            flux[:, 1:] = 1.0 - (e[:, 1:] * e[:, :-1]).sum(-1)
-            valid = torch.ones_like(flux)
-            valid[:, 0] = 0.0          # a window's first frame has no in-window predecessor
-            st = _stitch(torch.stack([flux * valid, valid], dim=-1))
-            flux = st[..., 0] / st[..., 1].clamp(min=1e-6)
-            flux[:, 0] = 0.0
-        return out + (flux,)
-
-    @torch.no_grad()
-    def _mel_flux(self, audio_batch, t_full):
-        '''
-        L2 change of the log-mel spectrum ENTERING each frame, on the model's own frame grid:
-        25 ms window, hop = one frame, `center=True`, so mel frame t is centred on sample
-        t * 80 exactly like conv frame t. [B, t_full], entry 0 = 0. No trainable parameters, so
-        training cannot erode it.
-        '''
-        import torchaudio
-        wav = audio_batch.reshape(audio_batch.shape[0], -1).float()
-        mel = getattr(self, '_mel_cache', None)
-        if mel is None or mel[0] != wav.device:
-            # Held outside the module tree: registered, its buffers would enter the state_dict.
-            t = torchaudio.transforms.MelSpectrogram(
-                self.sample_rate, n_fft=512, win_length=400, hop_length=self.frame_stride_samples,
-                n_mels=80, center=True).to(wav.device)
-            self._mel_cache = mel = (wav.device, t)
-        with torch.autocast(device_type=wav.device.type, enabled=False):
-            lm = (mel[1](wav) + 1e-6).log().transpose(1, 2)          # [B, frames, 80]
-        n = min(lm.shape[1], t_full)
-        flux = torch.zeros(wav.shape[0], t_full, device=wav.device)
-        flux[:, 1:n] = (lm[:, 1:n] - lm[:, :n - 1]).norm(dim=-1)
-        return flux
+        # The mel transform is cached in a plain dict outside the module tree: registered, its
+        # buffers would enter the state_dict.
+        cache = self.__dict__.setdefault('_mel_cache', {})
+        return clip.encode_clip(self.model, self.geometry, audio_batch,
+                                flux_source=str(self.hp.boundary_flux_source),
+                                max_frames=max_frames,
+                                fixed_window_batch=self.fixed_window_batch,
+                                return_embeddings=return_embeddings, return_flux=return_flux,
+                                cache=cache)
 
     def prior_weight_now(self):
         '''
@@ -433,42 +352,10 @@ class ComposedModel(L.LightningModule):
 
     @torch.no_grad()
     def align_batch(self, log_probs, seqs, seq_lens, spectral_lens, flux=None):
-        '''
-        Force-align a whole batch with the training-time decoder (one DP run for the batch).
-
-        Args:
-            log_probs: [B, T, C] ph-head log posteriors
-            seqs: [B, S] local token ids, seq_lens: [B]
-            spectral_lens: [B] valid frames per clip
-            flux: [B, T] from `encode_clip(..., return_flux=True)`; required when
-                `boundary_bonus_weight` is set
-        Returns:
-            list of B dicts with `phones` (the extended sequence, SIL pads included), `onsets`
-            (integer frame per phone), `refined` (float frame, interpolated at the posterior
-            crossing) and `used` (False for a phone the path skipped). An empty dict marks a
-            clip too short for its own sequence.
-        '''
-        al = self.loss_fn.align(log_probs, seqs, None, None, seq_lens, spectral_lens, flux=flux)
-        ext, ext_lens, feasible = al['ext'], al['ext_lens'], al['feasible']
-        onsets = al['onsets'].cpu()
-
-        lp_cpu = log_probs.detach().float().cpu()
-        ext_cpu, ext_lens_cpu = ext.cpu(), ext_lens.cpu()
-        out = []
-        for b in range(log_probs.shape[0]):
-            n_ext, n_frames = int(ext_lens_cpu[b]), int(spectral_lens[b])
-            if not bool(feasible[b]) or n_ext == 0:
-                out.append({})
-                continue
-            refined = refine_onsets(lp_cpu[b, :n_frames], ext_cpu[b, :n_ext],
-                                    onsets[b, :n_ext + 1])
-            out.append({
-                'phones': ext_cpu[b, :n_ext].tolist(),
-                'onsets': onsets[b, :n_ext].tolist(),
-                'refined': [float(v) for v in refined],
-                'used': [int(onsets[b, i + 1]) != int(onsets[b, i]) for i in range(n_ext)],
-            })
-        return out
+        '''Force-align a whole batch with the training-time decoder; see
+        `clip.decode_alignments`.'''
+        return clip.decode_alignments(self.loss_fn, log_probs, seqs, seq_lens, spectral_lens,
+                                      flux=flux)
 
     @torch.no_grad()
     def align_clip(self, log_probs, seq, n_frames, sub_frame=True, flux=None):

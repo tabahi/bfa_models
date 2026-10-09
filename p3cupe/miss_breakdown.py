@@ -1,7 +1,7 @@
 '''
 WHY the boundaries miss: sort every TIMIT boundary a checkpoint gets wrong into a cause.
 
-    /root/anaconda3/bin/python p3cupe/miss_breakdown.py <ckpt> [--bonus-weight W]
+    python p3cupe/miss_breakdown.py <ckpt> [--bonus-weight W]
 
 `error_breakdown.py` says WHERE the gap is (vowel onsets, laterals, rhotics, glides). This says
 WHY. It matches p3's aligned phone sequence to TIMIT's phone-by-phone (edit distance on broad
@@ -39,7 +39,7 @@ from argparse import Namespace
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from p3cupe.error_breakdown import PATHS_LIST, PHONE_CLASS, read_phn
 from p3cupe.timit_probe import DEFAULT_CACHE, _load_audio, load_cache

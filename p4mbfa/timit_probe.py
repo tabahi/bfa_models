@@ -62,7 +62,13 @@ def load_cache(cache_path, lang_group, n_tokens):
     return cache['clips']
 
 
-def _load_audio(path, sample_rate=16000):
+def _load_audio(path, sample_rate=16000, start=None, end=None):
+    '''
+    One probe clip, RMS-normalised. `start` / `end` (seconds) cut a segment out of a longer
+    file: a TIMIT clip is its whole file, but a Buckeye entry is a few seconds of a ~7 minute
+    interview, and its `boundaries_ms` are relative to `start`. The cut comes BEFORE the
+    normalisation, so the level is the segment's own, as it is for a training segment.
+    '''
     import torchaudio
     wav, sr = torchaudio.load(path)
     if wav.shape[0] > 1:
@@ -70,6 +76,10 @@ def _load_audio(path, sample_rate=16000):
     if sr != sample_rate:
         wav = torchaudio.functional.resample(wav, sr, sample_rate)
     wav = wav.squeeze(0)
+    if start is not None or end is not None:
+        lo = int(round(float(start or 0.0) * sample_rate))
+        hi = wav.numel() if end is None else int(round(float(end) * sample_rate))
+        wav = wav[max(lo, 0):max(hi, 0)]
     # Exactly `SegmentsCollator._rms_normalize`.
     rms = wav.pow(2).mean().sqrt()
     if rms > 0:
@@ -153,7 +163,8 @@ def score_model(pl_module, cache, batch_size=16, tolerances=DEFAULT_TOLERANCES,
     try:
         for start in range(0, len(cache), batch_size):
             chunk = cache[start:start + batch_size]
-            wavs = [_load_audio(c['audio'], sample_rate) for c in chunk]
+            wavs = [_load_audio(c['audio'], sample_rate, c.get('start'), c.get('end'))
+                    for c in chunk]
             wav_lens = torch.tensor([w.numel() for w in wavs], dtype=torch.long)
 
             padded = torch.zeros(len(wavs), 1, int(wav_lens.max()))

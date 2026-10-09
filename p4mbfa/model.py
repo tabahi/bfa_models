@@ -355,27 +355,35 @@ class MbfaCNN(nn.Module):
 
 class MbfaExtractor(nn.Module):
     '''
-    Load a trained p4mbfa checkpoint for downstream use (embeddings or posteriors).
+    The per-window network of a trained p4mbfa model, for downstream use (embeddings or
+    posteriors), from a release directory (`export_hf.py`: config.json + model.safetensors) or
+    a training checkpoint.
 
-    Windowing is the CALLER's job here: this wraps the per-window trunk, so feed it
-    `[N, input_wav_length]` windows and stitch with `windowing.stitch_windows` if you need
-    clip-long output. `trainer.ComposedModel.encode_clip` is the reference implementation.
+    Windowing is the CALLER's job here: feed it `[N, input_wav_length]` windows and stitch
+    with `windowing.stitch_windows` if you need clip-long output. For whole clips and forced
+    alignment use `inference.MbfaAligner`, which runs the training-time `clip.encode_clip`.
     '''
 
-    def __init__(self, ckpt_path, device='cuda'):
+    def __init__(self, path, device='cuda'):
         super().__init__()
+        import os
         self.device = device
-        checkpoint = torch.load(ckpt_path, weights_only=False, map_location='cpu')
-        if 'model_config' not in checkpoint:
-            raise ValueError(f"no model_config in {ckpt_path}; not a p4mbfa checkpoint")
-
-        model = MbfaCNN()
-        model.load_config_state_dict(checkpoint['model_config'])
-        model.make_model()
-
-        state = {k[len('model.'):]: v for k, v in checkpoint['state_dict'].items()
-                 if k.startswith('model.')}
-        model.load_state_dict(state, strict=True)
+        if os.path.isdir(path):
+            import json
+            from safetensors.torch import load_file
+            from p4mbfa.export_hf import build_model
+            with open(os.path.join(path, 'config.json')) as f:
+                model = build_model(json.load(f), load_file(os.path.join(path, 'model.safetensors')))
+        else:
+            checkpoint = torch.load(path, weights_only=False, map_location='cpu')
+            if 'model_config' not in checkpoint:
+                raise ValueError(f"no model_config in {path}; not a p4mbfa checkpoint")
+            model = MbfaCNN()
+            model.load_config_state_dict(checkpoint['model_config'])
+            model.make_model()
+            state = {k[len('model.'):]: v for k, v in checkpoint['state_dict'].items()
+                     if k.startswith('model.')}
+            model.load_state_dict(state, strict=True)
 
         self.model = model.to(device).eval()
         self.frames_per_window = model.frames_per_window

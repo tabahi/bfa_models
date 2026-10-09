@@ -1,7 +1,7 @@
 '''
 Where the boundary errors are: a p3cupe checkpoint against MFA, per TIMIT phone class.
 
-    /root/anaconda3/bin/python modules/p3cupe/error_breakdown.py <ckpt> [--half holdout|tune|all]
+    python p3cupe/error_breakdown.py <ckpt> [--half holdout|tune|all]
 
 Both aligners are scored on the SAME probe clips with the probe's own scorer
 (`levenshtein_align`, onsets in ms), and every labelled boundary is attributed to the TIMIT

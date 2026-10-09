@@ -2,10 +2,35 @@
 
 PyTorch models and training utilities used by
 [bournemouth-forced-aligner (BFA)](https://github.com/tabahi/bournemouth-forced-aligner).
-The current trainable model is CUPEv3 in [`p3cupe`](p3cupe/).
 
-This README is a quick-start guide for training and fine-tuning. For the model and loss
-details, see [`p3cupe/README.md`](p3cupe/README.md).
+| suite | what | labels |
+|---|---|---|
+| [`p4mbfa`](p4mbfa/) | **current**: multilingual phoneme encoder + forced aligner, one model per language group | [standard_g2p](https://github.com/tabahi/CharsiuG2P) local tokens (`.gs.json`) |
+| [`p3cupe`](p3cupe/) | CUPEv3, the previous suite (European-centric ph66 labels) | BFA's ph66 phonemizer (`.ts`) |
+
+## p4mbfa quick start
+
+```bash
+cp .local_paths.example.yaml .local_paths.yaml        # then fill in the paths, incl. standard_g2p_repo
+python p4mbfa/smoke_test.py                           # CPU, no dataset
+python p4mbfa/train_mbfa.py p4mbfa/mbfa_hp_<group>    # e.g. mbfa_hp (latin), mbfa_hp_cjk, ...
+python p4mbfa/export_hf.py release                    # the models in p4mbfa/hf_release.yaml
+python p4mbfa/export_hf.py push --dry-run             # then without --dry-run: upload to the Hub
+```
+
+Released models load without Lightning or the training yaml:
+
+```python
+from p4mbfa.inference import MbfaAligner
+aligner = MbfaAligner.from_pretrained("Tabahi/mbfa-latin")      # or a release dir / checkpoint
+segs = aligner.align(aligner.load_audio("clip.wav"), ["SIL", "h", "ɛ", "l", "o", "SIL"])
+```
+
+See [`p4mbfa/README.md`](p4mbfa/README.md) for the model, the language groups and the checkpoint
+rules, and [`p4mbfa/data.md`](p4mbfa/data.md) for the training data per group.
+
+The rest of this README is the quick-start guide for **p3cupe**. For its model and loss details,
+see [`p3cupe/README.md`](p3cupe/README.md).
 
 ## Requirements
 
@@ -199,10 +224,4 @@ workflow does not use W&B.
 - Missing data or path errors: verify your local path-list integration, `data_src`, and the
    generated `.ts` transcript files.
 
-## Useful Files
-
-- [`p3cupe/cupe_hp.yaml`](p3cupe/cupe_hp.yaml): example training configuration.
-- [`p3cupe/train_cupe.py`](p3cupe/train_cupe.py): training entry point.
-- [`p3cupe/smoke_test.py`](p3cupe/smoke_test.py): dataset-free validation check.
-- [`utils/data_prep_1.py`](utils/data_prep_1.py): transcript phonemization utility.
-- [`p3cupe/README.md`](p3cupe/README.md): detailed model, loss, and hyperparameter reference.
+e.

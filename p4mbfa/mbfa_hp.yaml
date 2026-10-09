@@ -1,17 +1,22 @@
 # Main training configuration for p4mbfa.
-# Run with: /root/anaconda3/bin/python p4mbfa/train_mbfa.py p4mbfa/mbfa_hp [key=value ...]
+# Run with: python p4mbfa/train_mbfa.py p4mbfa/mbfa_hp [key=value ...]
 #
 # Every key below is required: the code reads them without defaults, so a missing key raises
 # instead of silently taking a value from somewhere else.
+#
+# This file carries the explanations: what each critical setting does and what happens when it
+# goes up or down. The per-group yamls (mbfa_hp_<group>.yaml) have the same keys with shorter
+# comments. Keys marked [inference] are also written into a release's config.json by
+# export_hf.py and are used by inference.MbfaAligner, so changing them changes the decoder too.
 
-experiment: "ma04a"
-note: "no data limits"
+experiment: "ma04b"
+note: "ramp_frames: 4.0"
 project: "mbfa"
 
 # Basic run settings.
 gpu_num: [0, 1]
 data_src: "fleurs"     # splits.get_splits source. Must have .gs.json files next to its .srt.json.
-epochs: 30              # Also the OneCycle length. At ~500 h (~165k segments), batch 40 on 2 GPUs is
+epochs: 4              # Also the OneCycle length. At ~500 h (~165k segments), batch 40 on 2 GPUs is
                         # ~2000 steps x ~4.1 s = ~2.3 h per epoch; 30 epochs was sized for 30 h.
 dev_run: false          # true = run only a tiny test. Use this after changing the config.
 seed: 42
@@ -19,7 +24,11 @@ seed: 42
 # Batch and memory settings.
 batch_size: 44          # Clips per GPU, padded to duration_max (20 s). Measured peak allocated,
                         # one GPU, bf16: frame_blocks 4 -> 0.71 GB/clip (60 clips = 42.3 GB),
-                        # frame_blocks 8 -> 1.02 GB/clip (40 clips = 40.7 GB).
+                        # frame_blocks 8 -> 1.02 GB/clip (40 clips = 40.7 GB). Larger = almost
+                        # free throughput (the Viterbi loop barely depends on the batch) and a
+                        # steadier class_prior_norm estimate, limited only by GPU memory. Smaller
+                        # = more optimiser steps per epoch, which matters for the small groups
+                        # (japanese, mj01a, ran 25 steps per epoch).
 accumulate_grad_batches: 1
 dataloader_n_workers: 4
 train_limit: null           # null = all files. get_splits samples a limit from ALL of fleurs (161127
@@ -53,23 +62,31 @@ duration_max: 20        # seconds; ALSO the padding width. FLEURS latin keeps 94
                         # at 30 s (check_data.py's value) for 1.5x the compute per clip.
 ph_seq_min: 5           # fewest local tokens a segment may have
 ph_seq_max: 320         # most local tokens; the longest segment <= 20 s has 277
-tokens_per_sec_min: 2.0
-tokens_per_sec_max: 20.0
-max_fold_frac: 0.05     # most of a segment's tokens that may have folded to <unk>
+tokens_per_sec_min: 2.0 # Segments outside this speaking rate are dropped: they are usually a
+tokens_per_sec_max: 20.0 # transcript that does not match its audio. Narrower = cleaner, less data.
+max_fold_frac: 0.05     # most of a segment's tokens that may have folded to <unk>. Higher keeps
+                        # more data but trains on more <unk> (a phone the group cannot name);
+                        # lower drops languages whose lexicon folds a lot (Khmer folds 19.8%).
 skip_tonal: true        # skip files whose tone layer is real (none in latin)
 skip_unsegmented: true  # skip files that need word segmentation (none in latin)
-min_kept_frac: 0.9      # raise if fewer of the files or segments survive the filters
+min_kept_frac: 0.9      # raise if fewer of the files or segments survive the filters. A guard,
+                        # not a filter: lower it only after checking what the filters removed.
 regen_cache: false      # true = rebuild the collator cache even if one exists
 
 # Validation files. splits.get_splits('fleurs') returns the SAME list as train and val, so val is
 # held out of the train list instead: every Nth file, which covers every language. 0 = use the
 # splits' val list (the run raises if it overlaps train).
 
-val_max_segments: 400   # Maximum validation clips used each epoch.
+val_max_segments: 400   # Maximum validation clips used each epoch. More = a less noisy val_loss
+                        # (it picks the checkpoint for every group but latin), slower validation.
 
 # ------------------------------------------------------------------ audio windows
-window_size_ms: 120
-window_stride_ms: 80    # Must line up with the 5 ms frame grid.
+window_size_ms: 120     # [inference] Audio per network window; fixes the trunk's input length,
+                        # so it must equal the checkpoint's (a mismatch raises).
+window_stride_ms: 80    # [inference] Must line up with the 5 ms frame grid. Windows overlap by
+                        # size - stride (40 ms); the stitcher overlap-adds them with a cosine weight
+                        # that favours each window's centre. A larger stride is faster but leans
+                        # on frames nearer the edges, whose receptive field is half padding.
 
 # ------------------------------------------------------------------ model (trunk = p3cupe's)
 # These must equal trunk_init_path's / ckpt_path's trunk; a mismatch raises.
@@ -82,42 +99,103 @@ frame_blocks: 4         # Per-frame depth: capacity WITHOUT widening the 38.9 ms
 grow_frame_blocks: false # true = a checkpoint (ckpt_path or trunk_init_path) with FEWER blocks may
                         # load; the extra blocks start as the identity, so the grown model computes
                         # exactly what the checkpoint did. false = any block-count mismatch raises.
-ffn_mult: 4
-block_dropout: 0.3
-attn_radius: 0
-attn_heads: 8
-cnn_dropout: 0.2
-head_dropout: 0.3
-noise_level: 0.05
+ffn_mult: 4             # Hidden width of each frame block's MLP (x embed_dim). Trunk shape.
+attn_radius: 0          # 0 = no time mixing in the blocks. > 0 adds local attention over that many
+attn_heads: 8           # frames each side, which WIDENS the receptive field (the model would start
+                        # to see phonotactics). Both are trunk shape: they must match the checkpoint.
+
+# Regularisation. These may differ from the checkpoint's (they are not trunk shape). Higher =
+# less over-fitting to the self-made alignments, slower to fit; lower = fits faster, and the
+# TIMIT f1 peaks earlier and drifts more (self-consistency drift: the model agrees ever more
+# with its own alignments while the real boundaries get worse).
+block_dropout: 0.3      # inside each frame block
+cnn_dropout: 0.2        # in the convolutional front end
+head_dropout: 0.3       # before the three heads
+noise_level: 0.05       # std of Gaussian noise added to the waveform in training. Audio is
+                        # RMS-normalised to 1 first, so 0.05 is about 26 dB SNR (0.02 = 34 dB).
+                        # Higher = robustness to noisy recordings, at some cost on clean ones.
 
 # ------------------------------------------------------------------ loss and alignment
-# p3cupe's final recipe (pc01a), unchanged.
-min_phone_frames: 6
-soft_phone_frames: 10
-soft_frame_cost: 1.0
-sil_skippable: true
-boundary_bonus_weight: 30.0
-boundary_contrast_frames: 17
-boundary_flux_source: mel
-ramp_frames: 1.0
-optional_sil: true
-class_prior_norm: true
+# The targets are made by the model itself: every step, a segmental Viterbi aligns the clip's
+# known phone sequence to the ph_head posteriors, and a "hat" target is built around that path
+# (loss.py's docstring has the picture). These settings shape that aligner and that hat. They
+# follow p3cupe's final recipe (pc01a) except ramp_frames (1.0 here, 3.0 there).
+min_phone_frames: 6     # [inference] Hard minimum phone length, in 5 ms frames (6 = 30 ms). Higher
+                        # forbids real short phones (flaps, stops in fast speech) and makes more
+                        # clips infeasible (val_infeasible_frac); lower lets phones collapse to a
+                        # frame or two, which hard-EM then locks in.
+soft_phone_frames: 10   # [inference] Soft duration prior on top of the minimum: a phone shorter than
+soft_frame_cost: 1.0    # min + soft frames (16 = 80 ms) pays soft_frame_cost nats per missing frame.
+                        # Higher (either key) pushes towards longer, more even phones; 0 leaves the
+                        # durations above the minimum to the posteriors alone.
+sil_skippable: true     # [inference] Any SIL inside the sequence (a word gap from the phonemiser)
+                        # may take zero frames. false = every listed SIL must last at least
+                        # min_phone_frames, forcing a pause where the speaker did not stop.
+optional_sil: true      # [inference] Pad a skippable SIL at both ends, to absorb leading and
+                        # trailing silence. false = the first and last phone are dragged to the
+                        # clip edges (TIMIT clips open with ~130 ms of silence).
+boundary_bonus_weight: 30.0 # [inference] Nats added for STARTING a phone at a frame, per standard
+                        # deviation of the local log-mel change there. Higher = boundaries snap
+                        # to spectral change (sharp, but also onto changes inside a phone, e.g.
+                        # diphthongs and bursts) and the model learns less placement itself; lower
+                        # = boundaries come from the posteriors alone; 0 turns the flux off. The
+                        # TIMIT probe logs `nobonus_f1_25ms` as the model's own share.
+boundary_contrast_frames: 17 # [inference] Moving average (frames, 17 = 85 ms) subtracted from
+                        # the flux before scaling, so only LOCAL peaks of change count. Larger
+                        # lets broad loudness changes through; smaller keeps only the sharpest
+                        # peaks. 17 measured best (p3cupe).
+boundary_flux_source: mel # [inference] mel = log-mel of the audio; tap = the network's own
+                        # front-end features (p3cupe found mel better).
+ramp_frames: 4.0        # Width, in frames, over which a phone's target climbs from 0.5 at its
+                        # boundary to 1.0 inside it (the hat's sides; the neighbour gets 1 - w).
+                        # 1.0 = 5 ms, nearly a hard label: sharp posteriors, but the crossing that
+                        # gives sub-frame boundaries is read off a steeper, noisier edge, and a
+                        # misplaced boundary in the self-made alignment is taught as certain.
+                        # 3.0 = 15 ms (p3cupe's tuned value, about a real coarticulated
+                        # transition; ma02a, the best latin TIMIT model, used 3.0): softer, more
+                        # forgiving targets, but phones shorter than 2 x ramp become triangles
+                        # whose peak never reaches 1. Larger still = mushy phone interiors.
+                        # Untested at scale whether 1.0 costs TIMIT f1: the latin 1.0 runs
+                        # peaked near 71 against ma02a's 73.3, but they were also warm
+                        # continuations, which ma02a (random init) was not.
+class_prior_norm: true  # [inference] Align on p(class | frame) / mean p(class) instead of the
+                        # raw posterior, so a class predicted everywhere (SIL, a frequent vowel)
+                        # cannot dominate the path. false = alignments drift towards frequent
+                        # classes. The mean is over the batch, so a clip aligns slightly
+                        # differently alone and in a batch.
 
-group_loss_weight: 0.3  # phg head (gold_phg, cross-lingual)
+group_loss_weight: 0.3  # phg head (gold_phg, cross-lingual). Higher = the trunk is shaped more by
+                        # the 15 shared phoneme groups, which carry over to new language groups;
+                        # lower = more by this group's own phones.
 tone_loss_weight: 0.3   # tone head, over clips whose tone layer is real only. All of latin is
                         # masked, so this term is 0 there (logged as train_tone_frame_frac = 0).
+                        # Higher in a tonal group = the trunk is pushed towards pitch contour.
 
-soft_onset_mix: 1.0     # 0 = one best alignment (hard-EM)
-soft_target_scale: 0.3  # path-score scale of the occupancy, used only when soft_onset_mix > 0
-soft_onset_ramp_k: 0.0
-soft_onset_ramp_max: 6.0
+# Soft onsets: build the hat around each boundary's EXPECTED position under all alignments
+# (forward-backward occupancy), instead of the single best path's integer frame.
+soft_onset_mix: 1.0     # 0 = the Viterbi path's onsets (hard-EM); 1 = the expected onsets, which
+                        # are sub-frame and move smoothly between steps, which damps the hard-EM
+                        # oscillation. Values in between mix the two.
+soft_target_scale: 0.3  # Inverse temperature of the path scores, used only when soft_onset_mix > 0.
+                        # Higher = the occupancy collapses onto the Viterbi path (the same as mix
+                        # 0); lower = onsets are averaged over more alignments and pulled towards
+                        # the middle of their uncertainty.
+soft_onset_ramp_k: 0.0  # Widen each boundary's ramp by k x that onset's own std (frames), so an
+soft_onset_ramp_max: 6.0 # uncertain boundary is taught softly; capped at soft_onset_ramp_max
+                        # frames. 0 = every ramp is ramp_frames. Needs soft_onset_mix > 0.
 
 # Cold-start alignment help. All three heads start from random weights (only the trunk is
 # pretrained), so the first alignments are read off a random ph_head: pull them towards even
 # durations for the first epochs.
-align_prior_epochs: 2
-align_prior_sigma: 0.03
-align_prior_strength: 1.0
+align_prior_epochs: 2   # The prior's weight falls linearly 1 -> 0 over this many epochs. More =
+                        # longer flat start (needed from random weights); 0 = off, which is
+                        # right for a warm start that keeps its fine heads (reset_fine_heads:
+                        # false). A head reset needs it: the fresh ph_head is random.
+align_prior_sigma: 0.03 # Width of the band around even durations, as a fraction of the clip.
+                        # Smaller = alignments held closer to "divide the clip evenly"; larger =
+                        # a looser pull.
+align_prior_strength: 1.0 # Multiplies the prior; the penalty is strength / sigma^2 per unit of
+                        # squared deviation.
 
 # ------------------------------------------------------------------ TIMIT probe (validation only)
 # The cache is in lang_group's local tokens; build it with p4mbfa/timit_probe_prep.py. TIMIT is
@@ -129,21 +207,25 @@ timit_probe_every_n_epochs: 1
 
 # ------------------------------------------------------------------ optimizer
 lr: 1e-4                # Fresh heads on a pretrained trunk; p3cupe's warm starts used 5e-5.
-weight_decay: 0.01
-gradient_clip_val: 1.0
+                        # The PEAK of a OneCycle schedule reached at 30% of `epochs` (cosine
+                        # down after). Higher = faster, but can unlearn the pretrained trunk;
+                        # every group run hit its best val_loss just after the peak.
+weight_decay: 0.01      # AdamW. Higher = smaller weights, mild regularisation.
+gradient_clip_val: 1.0  # Clips the gradient norm; guards against a bad alignment's spike.
 
 # ------------------------------------------------------------------ checkpoints
-ckpt_monitor: "val_timit_tune_f1_25ms"
-ckpt_mode: "max"
+ckpt_monitor: "val_timit_tune_f1_25ms"  # The top-2 checkpoints by this metric are kept. TIMIT
+ckpt_mode: "max"        # exists only for latin; the other groups monitor val_loss (min), which is
+                        # measured against the model's OWN alignments, so it is a weaker guide.
 early_stop_metric: "val_loss"
 early_stop_mode: "min"
-patience: 3000
+patience: 3000          # Epochs without improvement before stopping; 3000 = effectively off.
 
 # Where the weights come from. At most one of the two may be set.
 #   ckpt_path:        a p4mbfa checkpoint (full model; see reset_fine_heads)
 #   trunk_init_path:  any p3cupe or p4mbfa checkpoint; ONLY its trunk is loaded, all heads fresh
 # Both empty = train from random weights (raise align_prior_epochs and lr for that).
-ckpt_path: "tmp/training/p4mbfa/ma02a/m_ma02a_final_e30.pt" #"tmp/training/p4mbfa/ma02a/m_ma02a_final_e10.pt"
+ckpt_path: "tmp/training/p4mbfa/ma04a/m_ma04a_final_e30.pt" #"tmp/training/p4mbfa/ma02a/m_ma02a_final_e10.pt"
 trunk_init_path: null #"tmp/training/p3cupe/pa07f/m_pa07f_epoch=0_step=1246_val_timit_nobonus_f1_25ms=73.4052.ckpt"
 
-# /root/anaconda3/bin/python p4mbfa/train_mbfa.py p4mbfa/mbfa_hp
+# python p4mbfa/train_mbfa.py p4mbfa/mbfa_hp

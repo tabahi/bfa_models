@@ -1,7 +1,7 @@
 '''
 Entry point.
 
-    /root/anaconda3/bin/python p4mbfa/train_mbfa.py p4mbfa/mbfa_hp [key=value ...]
+    python p4mbfa/train_mbfa.py p4mbfa/mbfa_hp [key=value ...]
 
 Takes a YAML path without the extension. Trailing `key=value` pairs override single yaml keys
 for a sweep arm, e.g. `experiment=ma01b lang_group=cyrillic n_tokens=127 reset_fine_heads=true`;

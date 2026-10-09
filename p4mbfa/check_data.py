@@ -12,10 +12,10 @@ sys.path.append(REPO_ROOT)
 from local_paths import get_path
 
 
-METADATA_DIR = get_path('metadata_base')  # e.g.  /mnt/intelpa-3/rehman/common_dir
+METADATA_DIR = get_path('metadata_base')
 
 sys.path.append(get_path('speech_data_manager_paths_manager'))
-sys.path.append("/mnt/intelpa-2/rehman/codes/CharsiuG2P")
+sys.path.append(get_path('standard_g2p_repo'))
 
 
 import splits
@@ -177,7 +177,7 @@ if __name__ == "__main__":
 
 ''' print(gold_data)
 
-{'audio_path': '/mnt/intelpa-3/rehman/speech_data/fleurs_dev_16khz/sl_si/4926296088328531102.wav', 'lang': 'slv', 'g2p_lang': 'slv', 
+{'audio_path': '/path/to/fleurs_dev_16khz/sl_si/4926296088328531102.wav', 'lang': 'slv', 'g2p_lang': 'slv', 
 'tonal': False, 'tone_layer': False, 'needs_word_segmentation': False, 'word_segmenter': None, 
 'n_tones': 22, 'n_stresses': 3, 'n_lengths': 3, 'n_gold_ph': 270, 'n_gold_phg': 15, 
 'segments': [{'start': 0.0, 'end': 9.6, 

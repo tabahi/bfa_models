@@ -18,6 +18,7 @@ notes.txt
 *.ckpt
 *.bin
 mem_test.py
+**/memory.*
 
 # Logs
 logs

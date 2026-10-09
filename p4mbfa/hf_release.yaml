@@ -1,0 +1,142 @@
+# The models published on Hugging Face: which training checkpoint each one is, and why.
+#
+#   python p4mbfa/export_hf.py release              # build out_dir/<name>/ for every model below
+#   python p4mbfa/export_hf.py push --dry-run       # list what would be uploaded, upload nothing
+#   python p4mbfa/export_hf.py push                 # create/update <namespace>/<name> on the Hub
+#
+# Each <name> is both the folder under out_dir and the Hub repo name. A release folder holds
+# model.safetensors + config.json (what inference.MbfaAligner loads), a README.md model card
+# (written only if absent, so hand edits survive a rebuild) and ckpt/<ckpt_name>, the training
+# checkpoint renamed, for fine-tuning with train_mbfa.py (`ckpt_path:`).
+#
+# trained_langs: the FLEURS languages in the training data (data.md); the model card's language
+# tags. standard_g2p's group has more members (config.json labels.member_langs).
+#
+# Selection (2026-10-08, numbers from the local wandb history):
+#   noise   - TIMIT is clean studio speech, so it favours models trained with little noise.
+#             Never publish a checkpoint trained without noise; among the rest, the one trained
+#             with the MOST noise (noise_level) wins, ranked on validation within that level. One
+#             latin model is kept as the best-on-TIMIT benchmark regardless of noise.
+#   latin   - TIMIT boundary f1@25ms, the only real boundary benchmark (tune half selects).
+#             mbfa-latin: the best checkpoint at the highest noise (0.05): ma04a e6, 71.22 tune
+#             (ma04a e9 71.21, ma02c e9 71.18, ma02b e5 70.85; all within ~0.1 on holdout).
+#             mbfa-latin-benchmark: the best TIMIT of every latin run, ma02a e8 at noise 0.02.
+#   others  - FLEURS val_loss, measured against the model's own alignments (no boundary labels
+#             outside English), so a weaker guide; the frame accuracies are reported next to it.
+#             One run each, all at noise 0.02 (no noise-0.05 run exists for these groups yet).
+#   CUPE-3-en - the p3cupe English model, see its entry.
+#
+# suite: p4mbfa (export_hf.export) or p3cupe (p3cupe/export_hf.py, which also needs
+# decoder_overrides: the decoder the checkpoint was scored with, where it differs from training).
+
+out_dir: tmp/training/selected_models_for_hf
+namespace: Tabahi
+
+models:
+  mbfa-latin:
+    suite: p4mbfa
+    checkpoint: tmp/training/p4mbfa/ma04a/m_ma04a_epoch=6_step=6846_val_timit_tune_f1_25ms=71.2195.ckpt
+    ckpt_name: latin_fleurs273h_ma04a_e6_timit_f1_25ms=71.22.ckpt
+    trained_langs: [af, az, bs, ca, cs, cy, da, de, en-US, es-419, et, fi, fil, fr, ga, gl, hu, id, is, it, lb, lt, mi, ms, mt, nb, nl, pl, pt-BR, ro, sk, sl, sv, sw, tr, uz]
+    train_data: "FLEURS latin, all 273.5 h, training noise_level 0.05 (~26 dB SNR)"
+    selected_on: "TIMIT f1@25ms on the tune half of the 400-clip probe, best of the noise-0.05 latin runs"
+    metrics:
+      timit_f1_25ms_tune: 71.22
+      timit_f1_25ms_holdout: 71.70
+      timit_f1_25ms_nobonus_holdout: 65.21
+      timit_f1_10ms_holdout: 53.99
+      timit_abs_err_ms_holdout: 16.13
+    note: >-
+      The recommended latin model: trained with the most noise of any latin run (0.05), for real
+      recordings. Continued from ma02a's final epoch (ramp_frames 1.0). TIMIT is clean speech, so
+      it scores lower there than mbfa-latin-benchmark (72.93 holdout), which trained at noise 0.02.
+
+  mbfa-latin-benchmark:
+    suite: p4mbfa
+    checkpoint: tmp/training/p4mbfa/ma02a/m_ma02a_epoch=8_step=5454_val_timit_tune_f1_25ms=73.3269.ckpt
+    ckpt_name: latin_fleurs170h_ma02a_e8_timit_f1_25ms=73.33.ckpt
+    trained_langs: [af, az, bs, ca, cs, cy, da, de, en-US, es-419, et, fi, fil, fr, ga, gl, hu, id, is, it, lb, lt, mi, ms, mt, nb, nl, pl, pt-BR, ro, sk, sl, sv, sw, tr, uz]
+    train_data: "FLEURS latin, a 62% sample (train_limit 100000): ~170 of 273.5 h, training noise_level 0.02 (~34 dB SNR)"
+    selected_on: "TIMIT f1@25ms on the tune half of the 400-clip probe, best of every latin run"
+    metrics:
+      timit_f1_25ms_tune: 73.33
+      timit_f1_25ms_holdout: 72.93
+      timit_f1_25ms_nobonus_holdout: 68.81
+      timit_f1_10ms_holdout: 54.94
+      timit_abs_err_ms_holdout: 15.59
+    note: >-
+      The benchmark latin model: the best TIMIT score of every latin run, for comparisons on clean
+      speech. Trained from random weights at noise 0.02; for real recordings prefer mbfa-latin
+      (noise 0.05).
+
+  mbfa-cjk:
+    suite: p4mbfa
+    checkpoint: tmp/training/p4mbfa/mc01a/m_mc01a_epoch=13_step=476_val_loss=2.5963.ckpt
+    ckpt_name: cjk_fleurs9h_mc01a_e13_val_loss=2.596.ckpt
+    trained_langs: [cmn, yue]
+    train_data: "FLEURS cjk, a 62% sample (train_limit 100000): ~9 of 14.9 h, training noise_level 0.02"
+    selected_on: "FLEURS val_loss (best of 30 epochs)"
+    metrics:
+      val_loss: 2.5963
+      val_frame_acc: 0.4795
+      val_frame_acc_groups: 0.6120
+    note: "Trunk and phg_head from latin ma02a (final epoch), ph_head and tone_head trained fresh."
+
+  mbfa-cyrillic:
+    suite: p4mbfa
+    checkpoint: tmp/training/p4mbfa/mr01a/m_mr01a_epoch=10_step=1562_val_loss=2.6518.ckpt
+    ckpt_name: cyrillic_fleurs40h_mr01a_e10_val_loss=2.652.ckpt
+    trained_langs: [be, bg, hr, kk, mk, ru, sr, uk]
+    train_data: "FLEURS cyrillic, a 62% sample (train_limit 100000): ~40 of 65.1 h, training noise_level 0.02"
+    selected_on: "FLEURS val_loss (best of 30 epochs; flat from epoch 6)"
+    metrics:
+      val_loss: 2.6518
+      val_frame_acc: 0.4318
+      val_frame_acc_groups: 0.5724
+    note: "Trunk and phg_head from latin ma02a (final epoch), ph_head and tone_head trained fresh."
+
+  mbfa-japanese:
+    # Epoch 8, not the val_loss best (epoch 9, 2.3287): 9 is where the frame accuracies start a
+    # fall they never recover from (0.504 -> 0.493 -> 0.458 -> ... 0.41), and its val_loss is only
+    # 0.02 lower. Swap in the epoch-9 file if you prefer the monitor's choice.
+    suite: p4mbfa
+    checkpoint: tmp/training/p4mbfa/mj01a/m_mj01a_epoch=8_step=225_val_loss=2.3491.ckpt
+    ckpt_name: japanese_fleurs7h_mj01a_e8_val_loss=2.349.ckpt
+    trained_langs: [ja]
+    train_data: "FLEURS japanese, all 7.0 h, training noise_level 0.02"
+    selected_on: "FLEURS val_loss and frame accuracy (epoch 8 of 30)"
+    metrics:
+      val_loss: 2.3491
+      val_frame_acc: 0.5036
+      val_frame_acc_groups: 0.5381
+    note: "Trunk and phg_head from latin ma02a (final epoch), ph_head and tone_head trained fresh."
+
+  # p3cupe (CUPE v3, ph66 labels, English), superseded by p4mbfa; published for BFA's ph66
+  # pipeline. All 56 p3cupe checkpoints strict-load into the current p3cupe CupeCNN (2026-10-08).
+  # Every p3cupe checkpoint trained at noise_level 0.01, so noise does not separate them.
+  # pa07f e0 is the best of every p3cupe run on TIMIT when all are re-scored with the final
+  # decoder (decoder_sweep.py, min 6 + soft 10 + bonus 30): 76.10 tune / 75.58 holdout, against
+  # pc01a (the final recipe, warm from pa07f) e0 75.20 / 74.73 and e2 75.10 / 74.76. The only
+  # multilingual p3cupe run, pa09a (mswc38), is the soft_target_mix 1.0 collapse; not published.
+  CUPE-3-en:
+    suite: p3cupe
+    checkpoint: tmp/training/p3cupe/pa07f/m_pa07f_epoch=0_step=1246_val_timit_nobonus_f1_25ms=73.4052.ckpt
+    ckpt_name: en_libri500_pa07f_e0_timit_f1_25ms=75.58.ckpt
+    trained_langs: [en]
+    train_data: "LibriSpeech, libri_500h (~497 h), one epoch, training noise_level 0.01"
+    selected_on: "TIMIT lev f1@25ms on the tune half, re-scored with the final decoder"
+    decoder_overrides: {min_phone_frames: 6}     # trained with min 3; min 6 decodes better
+    metrics:
+      timit_lev_f1_25ms_tune: 76.10
+      timit_lev_f1_25ms_holdout: 75.58
+      timit_lev_f1_25ms_bonus0_holdout: 73.77
+      timit_phone_hit_25ms_bonus0_holdout: 73.07
+      timit_phone_hit_25ms_holdout: 68.73
+    note: >-
+      Warm-started from pa07e; the lineage is pa01d -> pa07a (MLS, 7 languages, 100 h) ->
+      pa07b (libri_360h) -> pa07c, pa07d, pa07e (libri_500h) -> pa07f. Trained with
+      min_phone_frames 3, soft 10, onset bonus 30, ramp 3. For per-phone onset accuracy decode
+      with boundary_bonus_weight 0 (phone_hit 73.07 vs 68.73).
+
+# Not trained yet (yamls ready, no checkpoint): other_alphabetic, abjad, brahmic, thai_khmer,
+# vietnamese. Add an entry here once a run exists.

@@ -390,8 +390,35 @@ class CupeExtractor(nn.Module):
     '''
 
     def __init__(self, ckpt_path, device='cuda'):
+        '''`ckpt_path`: a training checkpoint, a release directory written by
+        `p3cupe/export_hf.py` (config.json + model.safetensors), or a Hugging Face repo id
+        (e.g. "Tabahi/CUPE-3-en"; only those two files are downloaded).'''
         super().__init__()
+        import os
         self.device = device
+        if not os.path.exists(ckpt_path):
+            from huggingface_hub import snapshot_download
+            ckpt_path = snapshot_download(ckpt_path,
+                                          allow_patterns=['config.json', 'model.safetensors'])
+        self.config = None
+        if os.path.isdir(ckpt_path):
+            import json
+            from safetensors.torch import load_file
+            from p3cupe.export_hf import build_model
+            with open(os.path.join(ckpt_path, 'config.json')) as f:
+                self.config = json.load(f)
+            model = build_model(self.config,
+                                load_file(os.path.join(ckpt_path, 'model.safetensors')))
+        else:
+            model = self._from_checkpoint(ckpt_path)
+
+        self.model = model.to(device).eval()
+        self.frames_per_window = model.frames_per_window
+        self.frame_stride_samples = model.frame_stride_samples
+        print("p3cupe loaded:", model.describe())
+
+    @staticmethod
+    def _from_checkpoint(ckpt_path):
         checkpoint = torch.load(ckpt_path, weights_only=False, map_location='cpu')
         if 'model_config' not in checkpoint:
             raise ValueError(f"no model_config in {ckpt_path}; not a p3cupe checkpoint")
@@ -409,11 +436,7 @@ class CupeExtractor(nn.Module):
             raise ValueError(f"checkpoint is missing weights for: {sorted(missing)[:8]}")
         if unexpected:
             print(f"WARN: ignoring unexpected checkpoint keys: {sorted(unexpected)[:8]}")
-
-        self.model = model.to(device).eval()
-        self.frames_per_window = model.frames_per_window
-        self.frame_stride_samples = model.frame_stride_samples
-        print("p3cupe loaded:", model.describe())
+        return model
 
     def to(self, device):
         self.device = device

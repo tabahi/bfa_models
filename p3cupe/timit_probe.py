@@ -57,7 +57,7 @@ import lightning as L
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.levenshtein import levenshtein_align
 from p3cupe.loss import (confidence_dip, embedding_delta, parabolic_refine, peak_pick)

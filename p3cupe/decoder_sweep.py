@@ -1,7 +1,7 @@
 '''
 Decoder-only sweep: re-align one checkpoint's posteriors under different decoder settings.
 
-    /root/anaconda3/bin/python modules/p3cupe/decoder_sweep.py <ckpt> [--half tune|holdout|all]
+    python p3cupe/decoder_sweep.py <ckpt> [--half tune|holdout|all]
         [--bonus 0 3 10 30] [--min 4 5 6] [--soft 4]
 
 The model runs once per clip; only `viterbi_align` is repeated, so a grid takes minutes. Each
@@ -24,7 +24,7 @@ from argparse import Namespace
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.levenshtein import levenshtein_align
 from p3cupe.error_breakdown import PATHS_LIST, read_phn

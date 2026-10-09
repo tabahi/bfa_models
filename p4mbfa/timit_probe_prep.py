@@ -1,7 +1,7 @@
 '''
 Build the TIMIT probe cache in a language group's LOCAL tokens.
 
-    /root/anaconda3/bin/python p4mbfa/timit_probe_prep.py [lang_group] [src_cache] [out_path]
+    python p4mbfa/timit_probe_prep.py [lang_group] [src_cache] [out_path]
 
 The probe force-aligns the clip's phone sequence and scores the onsets against TIMIT's
 hand-labelled boundaries, so it needs the sequence in the model's own dictionary. The p3cupe cache
@@ -33,7 +33,8 @@ from local_paths import get_path  # noqa: E402
 sys.path.append(get_path('standard_g2p_repo'))
 
 LANG = 'en'
-DEFAULT_SRC = "tmp/data/timit_probe_400_latin.json"
+DEFAULT_SRC = "tmp/data/timit_probe_400.json"     # the p3cupe ph66 cache; its OUTPUT is
+                                                  # tmp/data/timit_probe_400_<group>.json
 
 
 def default_out(lang_group):
