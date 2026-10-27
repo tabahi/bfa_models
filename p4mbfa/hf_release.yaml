@@ -24,7 +24,7 @@
 #   others  - FLEURS val_loss, measured against the model's own alignments (no boundary labels
 #             outside English), so a weaker guide; the frame accuracies are reported next to it.
 #             One run each, all at noise 0.02 (no noise-0.05 run exists for these groups yet).
-#   CUPE-3-en - the p3cupe English model, see its entry.
+#   CUPE-3-* - the p3cupe (CUPE v3) models, see their entries.
 #
 # suite: p4mbfa (export_hf.export) or p3cupe (p3cupe/export_hf.py, which also needs
 # decoder_overrides: the decoder the checkpoint was scored with, where it differs from training).
@@ -69,6 +69,25 @@ models:
       speech. Trained from random weights at noise 0.02; for real recordings prefer mbfa-latin
       (noise 0.05).
 
+  mbfa-latin-noEnglish:
+    suite: p4mbfa
+    checkpoint: tmp/training/p4mbfa/ma05a/m_ma05a_epoch=4_step=26095_val_timit_tune_f1_25ms=71.8978.ckpt
+    ckpt_name: latin_noEnglish_fleurs266h_ma05a_e4_timit_f1_25ms=71.90.ckpt
+    trained_langs: [af, az, bs, ca, cs, cy, da, de, es-419, et, fi, fil, fr, ga, gl, hu, id, is, it, lb, lt, mi, ms, mt, nb, nl, pl, pt-BR, ro, sk, sl, sv, sw, tr, uz]
+    train_data: "FLEURS latin without English (exclude_langs [en-US]): ~266 of 273.5 h, training noise_level 0.05 (~26 dB SNR)"
+    selected_on: "TIMIT f1@25ms on the tune half of the 400-clip probe (best of 9 epochs logged)"
+    metrics:
+      timit_f1_25ms_tune: 71.90
+      timit_f1_25ms_holdout: 71.77
+      timit_f1_25ms_nobonus_holdout: 65.53
+      timit_f1_10ms_holdout: 53.96
+      timit_abs_err_ms_holdout: 16.11
+    note: >-
+      Trained on latin lang group data from fleurs (same as mbfa-latin), except for English,
+      from random weights at noise 0.05. Its TIMIT scores are therefore on a language it never
+      heard: it matches mbfa-latin (71.70 holdout), which did train on English.
+
+
   mbfa-cjk:
     suite: p4mbfa
     checkpoint: tmp/training/p4mbfa/mc01a/m_mc01a_epoch=13_step=476_val_loss=2.5963.ckpt
@@ -111,13 +130,101 @@ models:
       val_frame_acc_groups: 0.5381
     note: "Trunk and phg_head from latin ma02a (final epoch), ph_head and tone_head trained fresh."
 
-  # p3cupe (CUPE v3, ph66 labels, English), superseded by p4mbfa; published for BFA's ph66
-  # pipeline. All 56 p3cupe checkpoints strict-load into the current p3cupe CupeCNN (2026-10-08).
+
+  # abjad, brahmic, thai_khmer, vietnamese (2026-10-26): one run each, warm from latin ma02a's
+  # final epoch, noise 0.02, all of the group's FLEURS data. Each is the run's lowest val_loss
+  # checkpoint; val_loss rises after it in every run (the final epochs are 0.04-0.25 worse).
+  mbfa-abjad:
+    suite: p4mbfa
+    checkpoint: tmp/training/p4mbfa/mp01a/m_mp01a_epoch=5_step=2196_val_loss=2.8549.ckpt
+    ckpt_name: abjad_fleurs38h_mp01a_e5_val_loss=2.855.ckpt
+    trained_langs: [ar, ckb, fa, sd, ur]
+    train_data: "FLEURS abjad, all 38.2 h, training noise_level 0.02"
+    selected_on: "FLEURS val_loss (best of 20 epochs; final epoch 2.988)"
+    metrics:
+      val_loss: 2.8549
+      val_frame_acc: 0.4126
+      val_frame_acc_groups: 0.5149
+    note: "Trunk and phg_head from latin ma02a (final epoch), ph_head and tone_head trained fresh."
+
+  mbfa-brahmic:
+    suite: p4mbfa
+    checkpoint: tmp/training/p4mbfa/mb01a/m_mb01a_epoch=4_step=595_val_loss=3.5548.ckpt
+    ckpt_name: brahmic_fleurs17h_mb01a_e4_val_loss=3.555.ckpt
+    trained_langs: [hi, or, ta]
+    train_data: "FLEURS brahmic, all 16.8 h, training noise_level 0.02"
+    selected_on: "FLEURS val_loss (best of 20 epochs; final epoch 3.707)"
+    metrics:
+      val_loss: 3.5548
+      val_frame_acc: 0.2727
+      val_frame_acc_groups: 0.4633
+    note: "Trunk and phg_head from latin ma02a (final epoch), ph_head and tone_head trained fresh."
+
+  mbfa-thai:
+    suite: p4mbfa
+    checkpoint: tmp/training/p4mbfa/mt01a/m_mt01a_epoch=8_step=504_val_loss=2.5226.ckpt
+    ckpt_name: thai_fleurs8h_mt01a_e8_val_loss=2.523.ckpt
+    trained_langs: [th]
+    train_data: "FLEURS thai_khmer without Khmer (exclude_langs [km]): Thai only, all 7.8 h, training noise_level 0.02"
+    selected_on: "FLEURS val_loss (best of 20 epochs; final epoch 2.565)"
+    metrics:
+      val_loss: 2.5226
+      val_frame_acc: 0.4881
+      val_frame_acc_groups: 0.5973
+      val_peak_ce_tone: 0.863
+    note: >-
+      Trunk and phg_head from latin ma02a (final epoch), ph_head and tone_head trained fresh.
+      Khmer is in the thai_khmer label space but was not trained (standard_g2p folds 19.8% of its
+      tokens to <unk>).
+
+  mbfa-vietnamese:
+    suite: p4mbfa
+    checkpoint: tmp/training/p4mbfa/mv01a/m_mv01a_epoch=6_step=462_val_loss=3.3472.ckpt
+    ckpt_name: vietnamese_fleurs9h_mv01a_e6_val_loss=3.347.ckpt
+    trained_langs: [vi]
+    train_data: "FLEURS vietnamese, all 8.7 h, training noise_level 0.02"
+    selected_on: "FLEURS val_loss (best of 30 epochs; final epoch 3.602, tone CE also worse)"
+    metrics:
+      val_loss: 3.3472
+      val_frame_acc: 0.2893
+      val_frame_acc_groups: 0.4653
+      val_peak_ce_tone: 0.879
+    note: "Trunk and phg_head from latin ma02a (final epoch), ph_head and tone_head trained fresh."
+
+  # other_alphabetic (2026-10-27): mo01b, a 20-epoch run (batch 44, wandb kxeukgmu) continued
+  # from mo01a epoch 6; an earlier, stopped mo01b run (batch 16) left the epoch=3_step=3068 and
+  # epoch=4_step=3835 files in the same folder, which are not this run.
+  mbfa-other-alphabetic:
+    suite: p4mbfa
+    checkpoint: tmp/training/p4mbfa/mo01b/m_mo01b_epoch=3_step=1116_val_loss=2.6278.ckpt
+    ckpt_name: other_alphabetic_fleurs40h_mo01b_e3_val_loss=2.628.ckpt
+    trained_langs: [am, el, hy, ka, ko]
+    train_data: "FLEURS other_alphabetic, all 39.8 h, training noise_level 0.02"
+    selected_on: "FLEURS val_loss (best of 20 epochs; final epoch 2.841)"
+    metrics:
+      val_loss: 2.6278
+      val_frame_acc: 0.4589
+      val_frame_acc_groups: 0.6319
+    note: >-
+      Trunk and phg_head from latin ma02a (final epoch), ph_head and tone_head trained fresh in
+      mo01a (onset bonus 30), then continued in mo01b with boundary_bonus_weight 0, which this
+      model's config.json keeps as its default decoder.
+
+
+  # p3cupe (CUPE v3, ph66 labels), superseded by p4mbfa; published for BFA's ph66 pipeline.
+  # All 68 files of the 22 p3cupe runs strict-load into the current p3cupe CupeCNN (2026-10-11).
   # Every p3cupe checkpoint trained at noise_level 0.01, so noise does not separate them.
-  # pa07f e0 is the best of every p3cupe run on TIMIT when all are re-scored with the final
-  # decoder (decoder_sweep.py, min 6 + soft 10 + bonus 30): 76.10 tune / 75.58 holdout, against
-  # pc01a (the final recipe, warm from pa07f) e0 75.20 / 74.73 and e2 75.10 / 74.76. The only
-  # multilingual p3cupe run, pa09a (mswc38), is the soft_target_mix 1.0 collapse; not published.
+  # All re-scored with the final decoder (decoder_sweep.py on CPU, min 6 + soft 10 + bonus 30),
+  # TIMIT lev f1@25 tune / holdout:
+  #   pa01d e3 76.20 / 76.00   e0 75.88 / 76.04    libri_500h, hard-EM   -> CUPE-3-en-base
+  #   pa07f e0 76.10 / 75.58                       libri_500h            -> CUPE-3-en
+  #   pa07c e2 75.88 / 75.87   e0 75.80 / 75.81    libri_500h, not published (within noise of both)
+  #   pc01a e0 75.20 / 74.73   e2 75.10 / 74.76    the final recipe, warm from pa07f
+  #   pa07a e0 74.79 / 74.15   e1 73.31 / 73.74   final e4 70.96 / 71.70   MLS_7l_100h -> CUPE-3-mls7
+  # pa01d and pa07c were restored on 2026-10-11, after CUPE-3-en was picked: pa01d e3 now leads
+  # on both halves (and per phone), but 0.1 on tune is inside the noise, so CUPE-3-en stays.
+  # pa07a is the only MLS_7l_100h run. The other multilingual run, pa09a (mswc38), is the
+  # soft_target_mix 1.0 collapse; not published.
   CUPE-3-en:
     suite: p3cupe
     checkpoint: tmp/training/p3cupe/pa07f/m_pa07f_epoch=0_step=1246_val_timit_nobonus_f1_25ms=73.4052.ckpt
@@ -138,5 +245,50 @@ models:
       min_phone_frames 3, soft 10, onset bonus 30, ramp 3. For per-phone onset accuracy decode
       with boundary_bonus_weight 0 (phone_hit 73.07 vs 68.73).
 
-# Not trained yet (yamls ready, no checkpoint): other_alphabetic, abjad, brahmic, thai_khmer,
-# vietnamese. Add an entry here once a run exists.
+  CUPE-3-en-base:
+    suite: p3cupe
+    checkpoint: tmp/training/p3cupe/pa01d/m_pa01d_epoch=3_step=4984_val_timit_sub_f1_25ms=75.9831.ckpt
+    ckpt_name: en_libri500_pa01d_e3_timit_f1_25ms=76.00.ckpt
+    trained_langs: [en]
+    train_data: "LibriSpeech, libri_500h (~497 h), 4 epochs, training noise_level 0.01"
+    selected_on: "TIMIT lev f1@25ms on the tune half, re-scored with the final decoder"
+    decoder_overrides: {soft_phone_frames: 10}   # trained with soft 4; soft 10 decodes better
+    metrics:
+      timit_lev_f1_25ms_tune: 76.20
+      timit_lev_f1_25ms_holdout: 76.00
+      timit_lev_f1_25ms_bonus0_holdout: 73.80
+      timit_phone_hit_25ms_bonus0_holdout: 74.63
+      timit_phone_hit_25ms_holdout: 68.63
+    note: >-
+      The root of the p3cupe lineage (pa01c -> pa01d): plain hard-EM targets, min_phone_frames 6,
+      soft 4, onset bonus 30, ramp 3, trained before the soft_target_mix runs that CUPE-3-en
+      descends from. The best TIMIT score of every p3cupe run, by a margin inside the noise
+      (CUPE-3-en: 76.10 tune / 75.58 holdout). For per-phone onset accuracy decode with
+      boundary_bonus_weight 0 (phone_hit 74.63 vs 68.63). CUPE-3-mls7 was warm-started from
+      this checkpoint.
+
+  CUPE-3-mls7:
+    # Epoch 0 of 4: the run falls on TIMIT every epoch (soft_target_mix 1.0, the drift recipe),
+    # so the first epoch is both the monitor's pick and the best re-scored.
+    suite: p3cupe
+    checkpoint: tmp/training/p3cupe/pa07a/m_pa07a_epoch=0_step=1615_val_timit_nobonus_f1_25ms=71.4390.ckpt
+    ckpt_name: mls7_mls700h_pa07a_e0_timit_f1_25ms=74.15.ckpt
+    trained_langs: [de, es, fr, it, nl, pl, pt]
+    train_data: "Multilingual LibriSpeech, MLS_7l_100h: 100 h each of German, Spanish, French, Italian, Dutch, Polish and Portuguese (700 h, no English), one epoch, training noise_level 0.01"
+    selected_on: "TIMIT lev f1@25ms on the tune half, re-scored with the final decoder (best of the run's three saved checkpoints)"
+    decoder_overrides: {soft_phone_frames: 10}   # trained with soft 4; soft 10 decodes better on tune
+    metrics:
+      timit_lev_f1_25ms_tune: 74.79
+      timit_lev_f1_25ms_holdout: 74.15
+      timit_lev_f1_25ms_bonus0_holdout: 70.89
+      timit_phone_hit_25ms_bonus0_holdout: 71.11
+      timit_phone_hit_25ms_holdout: 66.41
+    note: >-
+      The only multilingual CUPE v3: the English CUPE-3-en-base (pa01d epoch 3) trained one more
+      epoch on seven non-English MLS languages, with soft targets (soft_target_mix 1.0),
+      min_phone_frames 6, soft 4, onset bonus 30, ramp 3. There are no boundary labels outside
+      English, so the scores below are English TIMIT: they show how much English boundary
+      accuracy survived (76.00 -> 74.15 holdout), not how well the seven languages align. Later
+      epochs of this run kept falling on TIMIT (73.74 at epoch 1, 71.70 at epoch 4), so they
+      are not published.
+

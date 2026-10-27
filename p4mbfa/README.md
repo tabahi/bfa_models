@@ -49,12 +49,21 @@ clean speech, so it favours low-noise training).
 |---|---|---|---|---|
 | `Tabahi/mbfa-latin` | ma04a, 6 | 0.05 | 273.5 h | TIMIT f1@25ms 71.22 tune / 71.70 holdout, best at noise 0.05 |
 | `Tabahi/mbfa-latin-benchmark` | ma02a, 8 | 0.02 | ~170 h (62% sample) | TIMIT f1@25ms 73.33 tune / 72.93 holdout, best of all latin runs |
+| `Tabahi/mbfa-latin-noEnglish` | ma05a, 4 | 0.05 | ~266 h (latin without `en-US`) | TIMIT f1@25ms 71.90 tune / 71.77 holdout, on a language it never trained on |
 | `Tabahi/mbfa-cyrillic` | mr01a, 10 | 0.02 | ~40 h (62% sample) | FLEURS val_loss 2.652 |
+| `Tabahi/mbfa-other-alphabetic` | mo01b, 3 | 0.02 | 39.8 h | FLEURS val_loss 2.628 (decoder `boundary_bonus_weight: 0`) |
+| `Tabahi/mbfa-abjad` | mp01a, 5 | 0.02 | 38.2 h | FLEURS val_loss 2.855 |
+| `Tabahi/mbfa-brahmic` | mb01a, 4 | 0.02 | 16.8 h | FLEURS val_loss 3.555 |
 | `Tabahi/mbfa-cjk` | mc01a, 13 | 0.02 | ~9 h (62% sample) | FLEURS val_loss 2.596 |
+| `Tabahi/mbfa-vietnamese` | mv01a, 6 | 0.02 | 8.7 h | FLEURS val_loss 3.347 |
+| `Tabahi/mbfa-thai` | mt01a, 8 | 0.02 | 7.8 h (Thai; Khmer excluded) | FLEURS val_loss 2.523 |
 | `Tabahi/mbfa-japanese` | mj01a, 8 | 0.02 | 7.0 h | FLEURS val_loss 2.349 + frame accuracy |
 | `Tabahi/CUPE-3-en` (p3cupe, ph66) | pa07f, 0 | 0.01 | LibriSpeech 500 h | TIMIT f1@25ms 76.10 tune / 75.58 holdout |
+| `Tabahi/CUPE-3-en-base` (p3cupe, ph66) | pa01d, 3 | 0.01 | LibriSpeech 500 h | TIMIT f1@25ms 76.20 tune / 76.00 holdout, best p3cupe run |
+| `Tabahi/CUPE-3-mls7` (p3cupe, ph66) | pa07a, 0 | 0.01 | MLS, 7 languages, 700 h (no English) | TIMIT f1@25ms 74.79 tune / 74.15 holdout, warm from CUPE-3-en-base: English accuracy kept |
 
-other_alphabetic, abjad, brahmic, thai_khmer and vietnamese have yamls but no trained model yet.
+Every language group with a yaml now has a published model. The FLEURS val_loss picks are each
+run's lowest; val_loss rose after them in every run, so none is the final epoch.
 
 ## The model
 

@@ -5,14 +5,14 @@
 # Every key below is required: the code reads them without defaults, so a missing key raises
 # instead of silently taking a value from somewhere else.
 
-experiment: "mo01a"
-note: "first other_alphabetic run: trunk + phg_head from latin ma02a, fresh ph_head (104) and tone_head"
+experiment: "mo01b"
+note: "boundary_bonus_weight: 0.0"
 project: "mbfa"
 
 # Basic run settings.
-gpu_num: [0, 1]
+gpu_num: [0]
 data_src: "fleurs"     # splits.get_splits source. Must have .gs.json files next to its .srt.json.
-epochs: 30              # Also the OneCycle length. fleurs other_alphabetic (am el hy ka ko) is ~40 h
+epochs: 20              # Also the OneCycle length. fleurs other_alphabetic (am el hy ka ko) is ~40 h
                         # at duration_max 20: ~140 optimiser steps per epoch at batch 44 on 2 GPUs.
                         # cjk, cyrillic and japanese all reached their best val_loss at epoch 9-13,
                         # just after the OneCycle lr peak (epoch 9 of 30).
@@ -48,7 +48,7 @@ n_phg: 15               # gold phoneme groups, shared by every language: the FIX
 # fine heads are DISCARDED and fresh ones are built for lang_group / n_tokens / n_tones above;
 # the trunk and phg_head are kept. false = the checkpoint's fine heads must already match, or the
 # load raises. Needs ckpt_path.
-reset_fine_heads: true  # latin (208 tokens) -> other_alphabetic (104): new ph_head and tone_head
+reset_fine_heads: false  # latin (208 tokens) -> other_alphabetic (104): new ph_head and tone_head
 
 # ------------------------------------------------------------------ data filters (check_data.py)
 duration_min: 0.5       # seconds
@@ -99,7 +99,7 @@ min_phone_frames: 6
 soft_phone_frames: 10
 soft_frame_cost: 1.0
 sil_skippable: true
-boundary_bonus_weight: 30.0
+boundary_bonus_weight: 0.0
 boundary_contrast_frames: 17
 boundary_flux_source: mel
 ramp_frames: 1.0
@@ -146,7 +146,7 @@ patience: 3000
 #   ckpt_path:        a p4mbfa checkpoint (full model; see reset_fine_heads)
 #   trunk_init_path:  any p3cupe or p4mbfa checkpoint; ONLY its trunk is loaded, all heads fresh
 # Both empty = train from random weights (raise align_prior_epochs and lr for that).
-ckpt_path: "tmp/training/p4mbfa/ma02a/m_ma02a_final_e30.pt"   # with reset_fine_heads: keeps phg_head
+ckpt_path: "tmp/training/p4mbfa/mo01a/m_mo01a_epoch=6_step=2681_val_loss=2.9672.ckpt"   # with reset_fine_heads: keeps phg_head
 trunk_init_path: null
 
 # python p4mbfa/train_mbfa.py p4mbfa/mbfa_hp_other_alphabetic

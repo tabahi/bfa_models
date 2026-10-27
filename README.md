@@ -26,6 +26,12 @@ aligner = MbfaAligner.from_pretrained("Tabahi/mbfa-latin")      # or a release d
 segs = aligner.align(aligner.load_audio("clip.wav"), ["SIL", "h", "ɛ", "l", "o", "SIL"])
 ```
 
+One model per language group is published on Hugging Face (`Tabahi/mbfa-<group>`: latin, cyrillic,
+other-alphabetic, abjad, brahmic, cjk, vietnamese, thai, japanese); the full list with each one's
+source checkpoint is in [`p4mbfa/README.md`](p4mbfa/README.md#published-models). The older p3cupe
+models are published too: `Tabahi/CUPE-3-en`, `CUPE-3-en-base` and `CUPE-3-mls7` (see
+[`p3cupe/README.md`](p3cupe/README.md#published-models)).
+
 See [`p4mbfa/README.md`](p4mbfa/README.md) for the model, the language groups and the checkpoint
 rules, and [`p4mbfa/data.md`](p4mbfa/data.md) for the training data per group.
 

@@ -93,6 +93,7 @@ def load_paths(hp):
     assert (os.path.exists(train_paths[-1]['audio']))
     assert (os.path.exists(val_paths[-1]['audio']))
     print(train_paths[0])
+    
     return train_paths, val_paths, total_hours
 
 

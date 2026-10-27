@@ -8,7 +8,7 @@ layout as p4mbfa's releases:
     README.md           a model card, only if the directory has none (never overwritten)
 
 `model.CupeExtractor(<dir | HF repo id | ckpt>)` loads it. p3cupe is superseded by p4mbfa;
-this exists to publish its English checkpoint, and is driven by p4mbfa's manifest:
+this exists to publish its checkpoints, and is driven by p4mbfa's manifest:
 
     python p4mbfa/export_hf.py release      # entries with `suite: p3cupe` come through here
 
@@ -124,8 +124,10 @@ def model_card(config, trained_langs, repo_id, ckpt_name):
                        *[f"- {l.split('-')[0]}" for l in trained_langs],
                        "tags:", "- forced-alignment", "- phoneme-recognition",
                        "- phoneme-segmentation", "- speech", "---", ""])
+    langs = "English" if list(trained_langs) == ['en'] else \
+        f"multilingual ({', '.join(trained_langs)})"
     return front + f'''
-# CUPE v3 (p3cupe) · English
+# CUPE v3 (p3cupe) · {langs}
 
 A context-free CNN phoneme encoder (the third CUPE), trained without boundary labels to place
 phoneme boundaries: one ph66 phoneme distribution every 5 ms, each frame seeing at most

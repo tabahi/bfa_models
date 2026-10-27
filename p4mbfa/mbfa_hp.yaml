@@ -9,20 +9,20 @@
 # comments. Keys marked [inference] are also written into a release's config.json by
 # export_hf.py and are used by inference.MbfaAligner, so changing them changes the decoder too.
 
-experiment: "ma04b"
-note: "ramp_frames: 4.0"
+experiment: "ma05a"
+note: "no english"
 project: "mbfa"
 
 # Basic run settings.
 gpu_num: [0, 1]
 data_src: "fleurs"     # splits.get_splits source. Must have .gs.json files next to its .srt.json.
-epochs: 4              # Also the OneCycle length. At ~500 h (~165k segments), batch 40 on 2 GPUs is
+epochs: 20              # Also the OneCycle length. At ~500 h (~165k segments), batch 40 on 2 GPUs is
                         # ~2000 steps x ~4.1 s = ~2.3 h per epoch; 30 epochs was sized for 30 h.
 dev_run: false          # true = run only a tiny test. Use this after changing the config.
 seed: 42
 
 # Batch and memory settings.
-batch_size: 44          # Clips per GPU, padded to duration_max (20 s). Measured peak allocated,
+batch_size: 8          # Clips per GPU, padded to duration_max (20 s). Measured peak allocated,
                         # one GPU, bf16: frame_blocks 4 -> 0.71 GB/clip (60 clips = 42.3 GB),
                         # frame_blocks 8 -> 1.02 GB/clip (40 clips = 40.7 GB). Larger = almost
                         # free throughput (the Viterbi loop barely depends on the batch) and a
@@ -45,7 +45,7 @@ sample_rate: 16000      # Audio must already be at this rate; the collator raise
 # header, and raises on any mismatch.
 lang_group: "latin"     # which language group's local_ph the ph_head predicts
 n_tokens: 208           # local tokens of lang_group, INCLUDING <blank> SIL noise <unk>
-exclude_langs: []  # member languages to leave out, as the paths list spells them.
+exclude_langs: ['en-US']  # member languages to leave out, as the paths list spells them. English : en-US
                         # none for this group.
 n_tones: 22             # tone values, shared by every language (0 = no tone)
 n_phg: 15               # gold phoneme groups, shared by every language: the FIXED head
@@ -225,7 +225,7 @@ patience: 3000          # Epochs without improvement before stopping; 3000 = eff
 #   ckpt_path:        a p4mbfa checkpoint (full model; see reset_fine_heads)
 #   trunk_init_path:  any p3cupe or p4mbfa checkpoint; ONLY its trunk is loaded, all heads fresh
 # Both empty = train from random weights (raise align_prior_epochs and lr for that).
-ckpt_path: "tmp/training/p4mbfa/ma04a/m_ma04a_final_e30.pt" #"tmp/training/p4mbfa/ma02a/m_ma02a_final_e10.pt"
+ckpt_path: null #"tmp/training/p4mbfa/ma04a/m_ma04a_final_e30.pt" #"tmp/training/p4mbfa/ma02a/m_ma02a_final_e10.pt"
 trunk_init_path: null #"tmp/training/p3cupe/pa07f/m_pa07f_epoch=0_step=1246_val_timit_nobonus_f1_25ms=73.4052.ckpt"
 
 # python p4mbfa/train_mbfa.py p4mbfa/mbfa_hp

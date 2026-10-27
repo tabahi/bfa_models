@@ -462,8 +462,14 @@ class Segments_Collator(Dataset):
     def get_wav(self, clip_i, start_sample, end_sample):
         audio_path = self.all_clips_paths[clip_i]
         num_frames = end_sample - start_sample
-        wav, sr = torchaudio.load(audio_path, frame_offset=start_sample, num_frames=num_frames,
-                                  normalize=True)
+        has_error = False
+        try:
+            wav, sr = torchaudio.load(audio_path, frame_offset=start_sample, num_frames=num_frames, normalize=True)
+        except Exception as e:
+            print(f"Error reading {audio_path} [{start_sample}, {end_sample}): {e}")
+            wav = torch.zeros(1, num_frames)  # silence, so the segment is skipped later
+            sr = self.sample_rate  # avoid raising a sample rate error
+            has_error = True
         if sr != self.sample_rate:
             # frame_offset / num_frames were computed at `sample_rate`, so the segment is wrong.
             raise ValueError(f"{audio_path}: sample rate {sr}, expected {self.sample_rate}")
@@ -477,7 +483,7 @@ class Segments_Collator(Dataset):
         wav = wav[:self.wav_len_max]            # at most one sample of rounding
         wav_len = wav.shape[0]
         wav = torch.nn.functional.pad(wav, (0, self.wav_len_max - wav_len), 'constant', 0)
-        return wav, wav_len
+        return wav, wav_len, has_error
 
     @staticmethod
     def _rms_normalize(wav):
@@ -491,7 +497,7 @@ class Segments_Collator(Dataset):
 
     def __getitem__(self, idx):
         ph, grp, tone, tone_mask, ph_len, clip_i, start, end = self.SegmentClass.get(idx)
-        wav, wav_len = self.get_wav(clip_i, start, end)
+        wav, wav_len, has_error = self.get_wav(clip_i, start, end)
         return ph, grp, tone, tone_mask, wav.unsqueeze(0), ph_len, wav_len
 
     def decode(self, ph_seq):

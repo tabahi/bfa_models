@@ -10,9 +10,9 @@ note: "first brahmic run: trunk + phg_head from latin ma02a, fresh ph_head (96) 
 project: "mbfa"
 
 # Basic run settings.
-gpu_num: [0, 1]
+gpu_num: [0]
 data_src: "fleurs"     # splits.get_splits source. Must have .gs.json files next to its .srt.json.
-epochs: 30              # Also the OneCycle length. fleurs brahmic (hi or ta) is ~17 h
+epochs: 20              # Also the OneCycle length. fleurs brahmic (hi or ta) is ~17 h
                         # at duration_max 20: ~60 optimiser steps per epoch at batch 44 on 2 GPUs.
                         # cjk, cyrillic and japanese all reached their best val_loss at epoch 9-13,
                         # just after the OneCycle lr peak (epoch 9 of 30).
