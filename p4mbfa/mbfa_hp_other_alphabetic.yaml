@@ -5,8 +5,8 @@
 # Every key below is required: the code reads them without defaults, so a missing key raises
 # instead of silently taking a value from somewhere else.
 
-experiment: "mo01b"
-note: "boundary_bonus_weight: 0.0"
+experiment: "mo01a"
+note: "boundary_bonus_weight: 3.0"
 project: "mbfa"
 
 # Basic run settings.
@@ -99,7 +99,7 @@ min_phone_frames: 6
 soft_phone_frames: 10
 soft_frame_cost: 1.0
 sil_skippable: true
-boundary_bonus_weight: 0.0
+boundary_bonus_weight: 30.0
 boundary_contrast_frames: 17
 boundary_flux_source: mel
 ramp_frames: 1.0
