@@ -1,7 +1,7 @@
 # bfa_models
 
 PyTorch models and training utilities used by
-[bournemouth-forced-aligner (BFA)](https://github.com/tabahi/bournemouth-forced-aligner).
+[bournemouth-forced-aligner (BFA)](https://github.com/speech-industry/bournemouth-forced-aligner).
 
 | suite | what | labels |
 |---|---|---|

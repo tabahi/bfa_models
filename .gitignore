@@ -19,6 +19,7 @@ notes.txt
 *.bin
 mem_test.py
 **/memory.*
+memory.md
 
 # Logs
 logs

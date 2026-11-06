@@ -1,7 +1,7 @@
 # p4mbfa
 
 A context-free CNN phoneme encoder and forced aligner for many languages: p3cupe's trunk and
-segmental aligner, trained on [standard_g2p](https://github.com/tabahi/CharsiuG2P) labels with
+segmental aligner, trained on [standard_g2p](https://github.com/tabahi/Standard-G2P) labels with
 one **fixed** cross-lingual head and two **replaceable** per-language-group heads.
 
 ```bash

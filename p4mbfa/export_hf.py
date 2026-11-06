@@ -63,7 +63,7 @@ MANIFEST_MODEL_KEYS = ('suite', 'checkpoint', 'ckpt_name', 'trained_langs', 'tra
 # re-scored with, not the one they were trained with, so their entries name it.
 SUITE_KEYS = {'p4mbfa': (), 'p3cupe': ('decoder_overrides',)}
 CODE_URL = 'https://github.com/tabahi/bfa_models'
-G2P_URL = 'https://github.com/tabahi/CharsiuG2P'
+G2P_URL = 'https://github.com/tabahi/Standard-G2P'
 
 
 def _standard_g2p():
